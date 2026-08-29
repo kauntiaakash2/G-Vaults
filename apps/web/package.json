@@ -1,0 +1,29 @@
+{
+  "name": "@sih/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@sih/shared": "*",
+    "@tanstack/react-query": "^5.66.9",
+    "next": "^16.3.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.0",
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "eslint": "^9.22.0",
+    "eslint-config-next": "^16.3.3",
+    "typescript": "^5.7.3"
+  }
+}

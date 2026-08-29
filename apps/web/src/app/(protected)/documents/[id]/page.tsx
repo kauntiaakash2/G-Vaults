@@ -1,0 +1,123 @@
+'use client';
+
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useParams } from 'next/navigation';
+import { FormEvent, useMemo, useState } from 'react';
+import type { DocumentSummary, DocumentVersionSummary } from '@sih/shared';
+import { api, ApiError, apiBlob } from '@/lib/api';
+import { Breadcrumbs, ConfirmDialog, Icon, PageHeader, SkeletonRows, StateMessage, StatusBadge, formatBytes, formatDate } from '@/components/ui';
+
+type IntegrityResult = { status: 'VERIFIED' | 'MISMATCH'; versionId: string; versionNumber: number; checkedAt: string };
+type AuditEvent = { id: string; action: string; result: string; metadata: Record<string, unknown> | null; eventHash: string; previousHash: string | null; createdAt: string; actor: { id: string; name: string; email: string } | null; version: { id: string; versionNumber: number } | null };
+type AccessGrant = { id: string; permission: string; status: string; createdAt: string; revokedAt: string | null; department: { id: string; name: string; code: string } | null; user: { id: string; name: string; email: string } | null; grantedBy: { id: string; name: string } };
+type Department = { id: string; name: string; code: string };
+type Intelligence = { versionId: string | null; ocr: { status: string; text: string; engine?: string; updatedAt?: string } | null; summary: { summary: string; model: string } | null; jobs: { status: string; error?: string | null; updatedAt?: string }[] };
+type DocumentTab = 'versions' | 'text' | 'access' | 'audit';
+
+const deniedCapabilities = { view: true, download: false, edit: false, share: false, approve: false };
+
+export default function DocumentPage() {
+  const { id } = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
+  const [tab, setTab] = useState<DocumentTab>('versions');
+  const [showShare, setShowShare] = useState(false);
+  const [showVersion, setShowVersion] = useState(false);
+  const [fileError, setFileError] = useState('');
+  const [selectedVersionId, setSelectedVersionId] = useState<string | undefined>();
+  const [revokeTarget, setRevokeTarget] = useState<AccessGrant | null>(null);
+  const [grantPermission, setGrantPermission] = useState('VIEW');
+
+  const document = useQuery({ queryKey: ['document', id], queryFn: () => api<DocumentSummary>(`/documents/${id}`) });
+  const documentAuthorised = document.isSuccess;
+  const versions = useQuery({ queryKey: ['document-versions', id], queryFn: () => api<DocumentVersionSummary[]>(`/documents/${id}/versions`), enabled: documentAuthorised });
+  const audit = useQuery({ queryKey: ['document-audit', id], queryFn: () => api<AuditEvent[]>(`/documents/${id}/audit`), enabled: documentAuthorised });
+  const capabilities = document.data?.capabilities ?? deniedCapabilities;
+  const access = useQuery({ queryKey: ['document-access', id], queryFn: () => api<AccessGrant[]>(`/documents/${id}/access`), retry: false, enabled: documentAuthorised && capabilities.share });
+  const intelligence = useQuery({ queryKey: ['document-intelligence', id, selectedVersionId], queryFn: () => api<Intelligence>(`/documents/${id}/intelligence${selectedVersionId ? `?versionId=${encodeURIComponent(selectedVersionId)}` : ''}`), enabled: documentAuthorised });
+  const departments = useQuery({ queryKey: ['departments'], queryFn: () => api<Department[]>('/departments'), enabled: documentAuthorised && capabilities.share });
+
+  const verify = useMutation({ mutationFn: () => api<IntegrityResult>(`/documents/${id}/verify${selectedVersionId ? `?versionId=${encodeURIComponent(selectedVersionId)}` : ''}`), onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['document-audit', id] }) });
+  const createVersion = useMutation({ mutationFn: (form: FormData) => api<DocumentVersionSummary>(`/documents/${id}/versions`, { method: 'POST', body: form }), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['document', id] }); void queryClient.invalidateQueries({ queryKey: ['document-versions', id] }); void queryClient.invalidateQueries({ queryKey: ['document-audit', id] }); setShowVersion(false); } });
+  const grant = useMutation({ mutationFn: (body: object) => api<AccessGrant>(`/documents/${id}/access`, { method: 'POST', body: JSON.stringify(body) }), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['document-access', id] }); void queryClient.invalidateQueries({ queryKey: ['document-audit', id] }); setShowShare(false); } });
+  const revoke = useMutation({ mutationFn: (permissionId: string) => api<AccessGrant>(`/documents/${id}/access/${permissionId}`, { method: 'DELETE' }), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['document-access', id] }); void queryClient.invalidateQueries({ queryKey: ['document-audit', id] }); setRevokeTarget(null); } });
+  const process = useMutation({ mutationFn: (versionId?: string) => api(`/documents/${id}/process${versionId ? `?versionId=${encodeURIComponent(versionId)}` : ''}`, { method: 'POST' }), onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['document-intelligence', id] }) });
+
+  const transfer = async (mode: 'preview' | 'download', versionId?: string) => {
+    setFileError('');
+    try {
+      const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
+      const result = await apiBlob(`/documents/${id}/${mode === 'preview' ? 'content' : 'download'}${suffix}`);
+      const url = URL.createObjectURL(result.blob);
+      if (mode === 'preview') window.open(url, '_blank', 'noopener,noreferrer');
+      else { const anchor = window.document.createElement('a'); anchor.href = url; anchor.download = result.filename; anchor.click(); }
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      void queryClient.invalidateQueries({ queryKey: ['document-audit', id] });
+    } catch (error) { setFileError(error instanceof Error ? error.message : 'File request failed'); }
+  };
+
+  const targetVersionId = selectedVersionId ?? document.data?.currentVersion?.id;
+  const latestIntegrity = useMemo(() => audit.data?.find((event) => event.version?.id === targetVersionId && (event.action === 'INTEGRITY_VERIFIED' || event.action === 'INTEGRITY_FAILED')), [audit.data, targetVersionId]);
+  const currentVerification = verify.data && verify.data.versionId === targetVersionId ? verify.data.status : undefined;
+  const integrity = currentVerification ?? (latestIntegrity?.action === 'INTEGRITY_VERIFIED' ? 'VERIFIED' : latestIntegrity?.action === 'INTEGRITY_FAILED' ? 'MISMATCH' : 'NOT_CHECKED');
+  const submitVersion = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); createVersion.mutate(new FormData(event.currentTarget)); };
+  const submitGrant = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); grant.mutate({ departmentId: data.get('departmentId'), permission: data.get('permission') }); };
+
+  if (document.isPending) return <><div className="page-loading-title"/><SkeletonRows rows={6}/></>;
+  if (document.error) {
+    const denied = document.error instanceof ApiError && document.error.status === 403;
+    return <StateMessage tone="danger" title={denied ? 'You do not have access to this document' : 'Document unavailable'} detail={denied ? 'Your current case or document permissions do not allow this record to be opened.' : document.error.message}/>;
+  }
+  if (!document.data) return null;
+  const record = document.data;
+  const selectedVersion = versions.data?.find((item) => item.id === selectedVersionId) ?? record.currentVersion;
+  const processing = intelligence.data?.ocr?.status ?? intelligence.data?.jobs?.[0]?.status ?? 'PENDING';
+
+  return <>
+    <Breadcrumbs items={[{ label: 'Cases', href: '/cases' }, { label: record.case.caseNumber, href: `/cases/${record.case.id}` }, { label: record.title }]}/>
+    <PageHeader eyebrow={record.documentType} title={record.title} description={`${record.case.caseNumber} · ${record.case.title}`} meta={<StatusBadge tone="neutral">v{record.currentVersion?.versionNumber ?? '—'} current</StatusBadge>} actions={<div className="header-security"><Icon name="lock"/><span><strong>Protected storage</strong><small>{record.encryption}</small></span></div>}/>
+
+    <div className="document-toolbar" aria-label="Document actions">
+      <button className="button secondary" onClick={() => void transfer('preview', selectedVersionId)}><Icon name="file"/>Preview</button>
+      {capabilities.download && <button className="button secondary" onClick={() => void transfer('download', selectedVersionId)}><Icon name="download"/>Download</button>}
+      <button className="button primary" onClick={() => verify.mutate()} disabled={verify.isPending}><Icon name="shield"/>{verify.isPending ? 'Verifying…' : 'Verify integrity'}</button>
+      <span className="toolbar-divider"/>
+      {capabilities.edit && <button className="button ghost" onClick={() => setShowVersion((value) => !value)}><Icon name="plus"/>New version</button>}
+      {capabilities.share && <button className="button ghost" onClick={() => setShowShare((value) => !value)}><Icon name="users"/>Manage access</button>}
+    </div>
+
+    {integrity === 'MISMATCH' && <StateMessage tone="danger" title="Integrity verification failed" detail="The current document bytes do not match the recorded source digest. Do not rely on this version until the incident is reviewed."/>}
+    {(fileError || verify.error) && <StateMessage tone="danger" title="Document action failed" detail={fileError || verify.error?.message}/>} 
+
+    {(showVersion || showShare) && <div className="workspace-grid form-workspace">
+      {showVersion && <section className="section-surface" aria-labelledby="new-version-heading"><div className="section-heading"><div><p className="section-kicker">Version control</p><h2 id="new-version-heading">Create new version</h2><p>The current source remains preserved as a historical version.</p></div></div><form onSubmit={submitVersion}><label htmlFor="changeDescription"><span>Change description <em>Optional</em></span><textarea id="changeDescription" name="changeDescription" rows={3} maxLength={1000}/></label><label className="file-field" htmlFor="replacementFile"><span>Replacement file</span><input id="replacementFile" name="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.docx,.txt,.md" required/></label>{createVersion.error && <StateMessage tone="danger" title="Version could not be created" detail={createVersion.error.message}/>}<div className="form-actions"><button className="button secondary" type="button" onClick={() => setShowVersion(false)}>Cancel</button><button className="button primary" type="submit" disabled={createVersion.isPending}>{createVersion.isPending ? 'Protecting version…' : 'Create version'}</button></div></form></section>}
+      {showShare && <section className="section-surface" aria-labelledby="grant-access-heading"><div className="section-heading"><div><p className="section-kicker">Document policy</p><h2 id="grant-access-heading">Grant department access</h2><p>Grant only the capability required for the stated work.</p></div></div><form onSubmit={submitGrant}><label htmlFor="grantDepartment"><span>Department</span><select id="grantDepartment" name="departmentId" defaultValue="" required><option value="" disabled>Select department</option>{departments.data?.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.code})</option>)}</select></label><label htmlFor="grantPermission"><span>Permission</span><select id="grantPermission" name="permission" value={grantPermission} onChange={(event) => setGrantPermission(event.target.value)}>{['VIEW', 'DOWNLOAD', 'EDIT', 'SHARE', 'APPROVE'].map((permission) => <option key={permission}>{permission}</option>)}</select><small>{permissionDescription(grantPermission)}</small></label>{grant.error && <StateMessage tone="danger" title="Access could not be granted" detail={grant.error.message}/>}<div className="form-actions"><button className="button secondary" type="button" onClick={() => setShowShare(false)}>Cancel</button><button className="button primary" type="submit" disabled={grant.isPending}>{grant.isPending ? 'Granting access…' : `Grant ${grantPermission} access`}</button></div></form></section>}
+    </div>}
+
+    <div className="document-workspace">
+      <section className="document-viewer" aria-labelledby="preview-heading"><div className="viewer-header"><div><p className="section-kicker">Document preview</p><h2 id="preview-heading">{selectedVersion?.originalFilename ?? 'Source file'}</h2></div><StatusBadge tone={processingTone(processing)}>{formatStatus(processing)}</StatusBadge></div><button className="preview-canvas" onClick={() => void transfer('preview', selectedVersionId)} aria-label={`Preview ${selectedVersion?.originalFilename ?? record.title}`}><div className="file-preview-icon"><Icon name="file" size={34}/></div><strong>Open protected preview</strong><span>{selectedVersion?.mimeType ?? 'File'} · {formatBytes(selectedVersion?.fileSize ?? 0)}</span><small>The file is decrypted only after the API confirms your current VIEW permission.</small></button>{intelligence.data?.summary && <div className="summary-block"><div><p className="section-kicker">Generated summary</p><StatusBadge tone="warning">Experimental</StatusBadge></div><p>{intelligence.data.summary.summary}</p><small>Extractive prototype · Review against the source document before use.</small></div>}</section>
+      <aside className="record-sidebar">
+        <section aria-labelledby="integrity-heading"><div className="aside-heading"><h2 id="integrity-heading">Integrity</h2><StatusBadge tone={integrityTone(integrity)}>{integrity === 'NOT_CHECKED' ? 'Not checked' : integrity}</StatusBadge></div><p>{integrity === 'VERIFIED' ? 'SHA-256 matches the stored source digest.' : integrity === 'MISMATCH' ? 'Recorded and current bytes do not match.' : 'Run verification before relying on this version.'}</p>{latestIntegrity && <small>Last event: {formatDate(latestIntegrity.createdAt)}</small>}<button className="text-button" onClick={() => verify.mutate()} disabled={verify.isPending}>Verify {selectedVersionId ? 'selected version' : 'again'}<Icon name="chevron" size={15}/></button></section>
+        <section aria-labelledby="metadata-heading"><h2 id="metadata-heading">Record details</h2><dl className="metadata-list"><div><dt>Case</dt><dd>{record.case.caseNumber}</dd></div><div><dt>Department</dt><dd>{record.ownerDepartment.name}</dd></div><div><dt>Current version</dt><dd>v{record.currentVersion?.versionNumber ?? '—'}</dd></div><div><dt>Selected version</dt><dd>v{selectedVersion?.versionNumber ?? '—'}</dd></div><div><dt>Owner</dt><dd>{record.createdBy.name}</dd></div><div><dt>Updated</dt><dd>{formatDate(record.updatedAt)}</dd></div></dl></section>
+        <details className="technical-details"><summary>Technical details</summary><dl className="metadata-list"><div><dt>Encryption</dt><dd>{record.encryption}</dd></div><div><dt>Digest</dt><dd className="hash-value">{selectedVersion?.sha256Hash ?? '—'}</dd></div><div><dt>MIME type</dt><dd>{selectedVersion?.mimeType ?? '—'}</dd></div></dl></details>
+      </aside>
+    </div>
+
+    <nav className="workspace-tabs document-tabs" aria-label="Document sections" role="tablist">{([{ key: 'versions', label: 'Versions', count: versions.data?.length }, { key: 'text', label: 'Extracted text' }, { key: 'access', label: 'Access' }, { key: 'audit', label: 'Audit', count: audit.data?.length }] as { key: DocumentTab; label: string; count?: number }[]).map((item) => <button key={item.key} role="tab" aria-selected={tab === item.key} aria-controls={`document-${item.key}`} onClick={() => setTab(item.key)}>{item.label}{item.count !== undefined && <span>{item.count}</span>}</button>)}</nav>
+
+    {tab === 'versions' && <section className="section-surface attached-section" id="document-versions" role="tabpanel"><div className="section-heading"><div><p className="section-kicker">Version history</p><h2>Preserved document versions</h2><p>Select a version to inspect, verify, preview, or process independently.</p></div></div>{versions.isPending ? <SkeletonRows/> : versions.data?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Version</th><th>File</th><th>Change</th><th>Created by</th><th>Created</th><th>Actions</th></tr></thead><tbody>{versions.data.map((version) => <tr className={selectedVersion?.id === version.id ? 'selected-row' : ''} key={version.id}><td><button className="version-select" onClick={() => setSelectedVersionId(version.id)}><strong>v{version.versionNumber}</strong>{record.currentVersion?.id === version.id && <StatusBadge tone="info">Current</StatusBadge>}</button></td><td><span className="cell-stack"><strong>{version.originalFilename}</strong><small>{formatBytes(version.fileSize)}</small></span></td><td>{version.changeDescription || <span className="muted">No description</span>}</td><td>{version.creator?.name ?? 'Unknown'}</td><td>{formatDate(version.createdAt)}</td><td><div className="table-actions"><button className="icon-button" title="Preview version" aria-label={`Preview version ${version.versionNumber}`} onClick={() => void transfer('preview', version.id)}><Icon name="file"/></button>{capabilities.download && <button className="icon-button" title="Download version" aria-label={`Download version ${version.versionNumber}`} onClick={() => void transfer('download', version.id)}><Icon name="download"/></button>}{capabilities.edit && <button className="icon-button" title="Extract text" aria-label={`Extract text from version ${version.versionNumber}`} onClick={() => { setSelectedVersionId(version.id); setTab('text'); process.mutate(version.id); }}><Icon name="search"/></button>}</div></td></tr>)}</tbody></table></div> : <StateMessage title="No versions recorded"/>}</section>}
+
+    {tab === 'text' && <section className="section-surface attached-section" id="document-text" role="tabpanel"><div className="section-heading"><div><p className="section-kicker">Derived content</p><h2>Extracted text · v{selectedVersion?.versionNumber ?? '—'}</h2><p>Searchable text is derived from this version and does not modify the source file.</p></div>{capabilities.edit && <button className="button secondary" onClick={() => process.mutate(selectedVersion?.id)} disabled={process.isPending}><Icon name="search"/>{process.isPending ? 'Processing…' : 'Extract or retry'}</button>}</div>{process.error && <StateMessage tone="danger" title="Text extraction failed" detail={`${process.error.message} The original document remains stored and accessible.`}/>} {intelligence.isPending ? <SkeletonRows rows={4}/> : intelligence.data?.jobs?.[0]?.status === 'FAILED' ? <StateMessage tone="danger" title="Text extraction failed" detail={`${intelligence.data.jobs[0].error || 'The processing worker could not complete this version.'} The original document remains available.`}/> : intelligence.data?.ocr?.text ? <pre className="extracted-text">{intelligence.data.ocr.text}</pre> : <StateMessage title="No extracted text is available" detail={capabilities.edit ? 'Start extraction for this version. Text PDFs are extracted directly; scanned pages require OCR.' : 'A user with EDIT permission must process this version.'}/>}</section>}
+
+    {tab === 'access' && <section className="section-surface attached-section" id="document-access" role="tabpanel"><div className="section-heading"><div><p className="section-kicker">Document policy</p><h2>Explicit access grants</h2><p>Document grants are evaluated against current database state on every request.</p></div>{capabilities.share && <button className="button secondary" onClick={() => setShowShare(true)}><Icon name="plus"/>Grant access</button>}</div>{!capabilities.share ? <StateMessage title="You can view this document but cannot manage access" detail="SHARE authority is required to list, grant, or revoke document permissions."/> : access.isPending ? <SkeletonRows/> : access.error ? <StateMessage tone="danger" title="Access policy could not be loaded" detail={access.error.message}/> : access.data?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>Principal</th><th>Type</th><th>Permission</th><th>Granted by</th><th>Granted</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{access.data.map((item) => <tr key={item.id}><td><strong>{item.department?.name || item.user?.name || 'Unknown principal'}</strong></td><td>{item.department ? 'Department' : 'User'}</td><td>{item.permission}</td><td>{item.grantedBy.name}</td><td>{formatDate(item.createdAt)}</td><td><StatusBadge tone={item.status === 'ACTIVE' ? 'success' : 'neutral'}>{item.status}</StatusBadge></td><td>{item.status === 'ACTIVE' && <button className="button danger compact" onClick={() => setRevokeTarget(item)}>Revoke</button>}</td></tr>)}</tbody></table></div> : <StateMessage title="No explicit grants" detail="Only the creator, platform policy, and case context currently provide access."/>}</section>}
+
+    {tab === 'audit' && <section className="section-surface attached-section" id="document-audit" role="tabpanel"><div className="section-heading"><div><p className="section-kicker">Security history</p><h2>Document audit trail</h2><p>Recorded access, integrity, sharing, download, and processing events.</p></div><span className="result-count">{audit.data?.length ?? 0} events</span></div>{audit.isPending ? <SkeletonRows rows={6}/> : audit.error ? <StateMessage tone="danger" title="Audit trail could not be loaded" detail={audit.error.message}/> : audit.data?.length ? <div className="table-wrap audit-table-wrap"><table className="data-table"><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Version</th><th>Result</th></tr></thead><tbody>{audit.data.map((event) => <tr key={event.id}><td><time dateTime={event.createdAt}>{formatDate(event.createdAt)}</time></td><td>{event.actor?.name ?? 'System'}</td><td><strong>{formatStatus(event.action)}</strong></td><td>{event.version ? `v${event.version.versionNumber}` : '—'}</td><td><StatusBadge tone={auditTone(event.result, event.action)}>{event.result}</StatusBadge></td></tr>)}</tbody></table></div> : <StateMessage title="No audit events recorded"/>}</section>}
+
+    <ConfirmDialog open={Boolean(revokeTarget)} title="Revoke document access?" description={`${revokeTarget?.department?.name || revokeTarget?.user?.name || 'This principal'} will immediately lose ${revokeTarget?.permission ?? ''} access for new requests. The revocation will be audited.`} confirmLabel="Revoke access" pending={revoke.isPending} onCancel={() => setRevokeTarget(null)} onConfirm={() => revokeTarget && revoke.mutate(revokeTarget.id)}/>
+  </>;
+}
+
+function formatStatus(value: string) { return value.replaceAll('_', ' '); }
+function integrityTone(value: string): 'success' | 'danger' | 'neutral' { return value === 'VERIFIED' ? 'success' : value === 'MISMATCH' ? 'danger' : 'neutral'; }
+function processingTone(value: string): 'success' | 'danger' | 'warning' | 'neutral' { return ['COMPLETED', 'READY'].includes(value) ? 'success' : value === 'FAILED' ? 'danger' : ['PROCESSING', 'PENDING'].includes(value) ? 'warning' : 'neutral'; }
+function auditTone(result: string, action: string): 'success' | 'danger' | 'warning' | 'neutral' { return result === 'DENIED' || action === 'INTEGRITY_FAILED' ? 'danger' : result === 'FAILURE' ? 'warning' : 'success'; }
+function permissionDescription(permission: string) { return ({ VIEW: 'Open metadata and preview the protected file.', DOWNLOAD: 'Export a copy of the underlying file.', EDIT: 'Create versions and run text extraction.', SHARE: 'Manage document access grants.', APPROVE: 'Record approval authority when supported by workflow.' } as Record<string, string>)[permission]; }

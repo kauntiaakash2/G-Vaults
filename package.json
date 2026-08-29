@@ -1,0 +1,29 @@
+{
+  "name": "sih-26190",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"npm run start:dev -w @sih/api\" \"npm run dev -w @sih/web\"",
+    "build": "npm run build -w @sih/shared && npm run build -w @sih/api && npm run build -w @sih/web",
+    "test": "npm run test -w @sih/api",
+    "test:e2e": "npm run test:e2e -w @sih/api",
+    "test:web": "npm run test:e2e -w @sih/web",
+    "lint": "npm run lint -w @sih/api && npm run lint -w @sih/web",
+    "db:generate": "npm run prisma:generate -w @sih/api",
+    "db:migrate": "npm --workspace=@sih/api run prisma:migrate --",
+    "db:deploy": "npm run prisma:deploy -w @sih/api",
+    "db:seed": "npm run prisma:seed -w @sih/api",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
