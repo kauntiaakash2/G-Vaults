@@ -42,8 +42,8 @@ authorizes a document/version before supplying bytes and stores the result.
 - `AuthModule`: password verification, JWT issuance and current-user loading.
 - `UsersModule` / `DepartmentsModule`: administrative reference data.
 - `CasesModule`: case scope and case membership.
-- `DocumentsModule`: resource authorization, ingestion, versions, grants,
-  retrieval, fixity, search and processing orchestration.
+- `DocumentsModule`: resource authorization, ingestion, evidence lineage, grants,
+  retrieval, fixity, custody events, legal holds, record lifecycle, search and processing orchestration.
 - `EncryptionModule`: AES-256-GCM envelope operations.
 - `StorageModule`: MinIO implementation behind `StorageService`.
 - `AuditModule`: serialized hash-linked audit-event creation.
@@ -91,17 +91,17 @@ impact of an XSS defect.
 
 ## Authorization lifecycle
 
-The current model is RBAC plus case membership/department scope plus active
-user/department document grants. `DocumentAuthorizationService` centralizes
-document permission checks. Creators and ADMIN currently bypass document grants;
-AUDITOR receives VIEW only. The administrative-content bypass requires
-separation-of-duties review in Phase 2.
+The current model is RBAC plus case membership/department scope, prototype
+classification clearance and current user/department document grants.
+`DocumentAuthorizationService` centralizes document permission checks. Creators
+receive capabilities within clearance; AUDITOR receives VIEW within clearance.
+ADMIN is separated from evidence authority and has no document bypass.
 
 The least-privilege capability rules are:
 
 - VIEW may be satisfied by a stronger document capability because metadata must
   be visible to exercise it.
-- DOWNLOAD requires an explicit DOWNLOAD grant (or current creator/admin bypass).
+- DOWNLOAD requires an explicit DOWNLOAD grant (or current creator authority).
 - EDIT, SHARE and APPROVE require their matching capability.
 - REVOKED rows never satisfy a query.
 
@@ -143,6 +143,19 @@ New content creates a new row and unique object key. The transaction calculates
 and the API asks the caller to retry. The current-version pointer changes; prior
 rows/objects are not edited by normal APIs. This is application-level append-only
 versioning, not storage-enforced WORM.
+
+Version 1 is `ORIGINAL`. Subsequent authoritative updates are `REVISION` and
+point to the prior current version. `DERIVED`/`REDACTED` versions require a
+source version in the same document and are marked non-authoritative. OCR and
+summaries remain separate derived rows rather than document versions.
+
+## Record and custody lifecycle
+
+`CustodyService` writes typed evidence-history events separately from the
+hash-linked security audit. `RecordsService` enforces allowed logical record
+transitions and legal holds. Hold placement/release and lifecycle changes
+require APPROVE. An active hold blocks `DISPOSED` and records the denial. The
+prototype does not physically purge bytes or enforce storage retention locks.
 
 ## OCR lifecycle
 
@@ -212,7 +225,8 @@ mechanism but not independently protected or legally sufficient chain of custody
 - No malware scanner, quarantine, content disarm, or rich format validation.
 - No KMS/HSM, envelope keys, rotation, or tested key recovery.
 - No protected independent audit archive or audit-chain verifier.
-- No legal hold, retention/disposition or explicit custody/provenance model.
+- Legal hold/lifecycle/provenance are prototype application controls; no WORM,
+  physical disposition, official retention schedule or legally validated custody assurance.
 - No MFA/federated identity or break-glass flow.
 - No real PostgreSQL/MinIO testcontainers suite.
 - OCR PDF/scanned corpus is not yet demonstrated end to end.

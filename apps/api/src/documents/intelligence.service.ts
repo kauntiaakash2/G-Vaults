@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { DocumentPermission, Prisma } from '@prisma/client';
+import { DocumentPermission, Prisma, ProcessingJobStatus } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 import type { AuthenticatedUser } from '../common/auth-user';
 import { AuditService } from '../audit/audit.service';
 import { DocumentAuthorizationService } from './document-authorization.service';
@@ -7,9 +8,13 @@ import { EncryptionService } from '../encryption/encryption.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { OcrClientService } from './ocr-client.service';
+import { allowedClassifications } from './document-policy';
 
 @Injectable()
 export class IntelligenceService {
+  private readonly leaseDurationMs = 60_000;
+  private readonly retryBaseDelayMs = 5_000;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
@@ -26,19 +31,73 @@ export class IntelligenceService {
       ? await this.prisma.documentVersion.findFirst({ where: { id: versionId, documentId }, include: { ocrResult: true, aiSummary: true } })
       : null;
     const jobs = await this.prisma.processingJob.findMany({ where: { documentVersionId: version?.id }, orderBy: { createdAt: 'desc' } });
-    return { versionId: version?.id ?? null, ocr: version?.ocrResult ?? null, summary: version?.aiSummary ?? null, jobs };
+    return { versionId: version?.id ?? null, ocr: version?.ocrResult ?? null, summary: version?.aiSummary ?? null, jobs: jobs.map((job) => this.jobView(job)) };
   }
 
   async processVersion(versionId: string) {
     const version = await this.prisma.documentVersion.findUnique({ where: { id: versionId }, include: { document: true } });
     if (!version) throw new NotFoundException('Document version not found');
-    const job = await this.prisma.processingJob.findFirst({ where: { documentVersionId: versionId, type: 'OCR', status: 'PENDING' }, orderBy: { createdAt: 'asc' } });
+    const now = new Date();
+    const staleBefore = new Date(now.getTime() - this.leaseDurationMs);
+    const job = await this.prisma.processingJob.findFirst({
+      where: {
+        documentVersionId: versionId,
+        type: 'OCR',
+        OR: [
+          { status: ProcessingJobStatus.QUEUED, nextAttemptAt: { lte: now } },
+          { status: ProcessingJobStatus.RETRY_PENDING, nextAttemptAt: { lte: now } },
+          { status: ProcessingJobStatus.RUNNING, lockedAt: { lte: staleBefore } },
+        ],
+      },
+      orderBy: { createdAt: 'asc' },
+    });
     if (!job) return this.statusForVersion(versionId);
-    await this.prisma.processingJob.update({ where: { id: job.id }, data: { status: 'PROCESSING', attempts: { increment: 1 }, startedAt: new Date() } });
-    await this.audit.append({ action: 'OCR_STARTED', entityType: 'document_version', entityId: versionId, caseId: version.document.caseId, documentId: version.documentId, versionId });
+
+    if (job.attempts >= job.maxAttempts) {
+      await this.prisma.processingJob.update({
+        where: { id: job.id },
+        data: {
+          status: ProcessingJobStatus.DEAD,
+          completedAt: now,
+          lockedAt: null,
+          lockedBy: null,
+          lastError: job.lastError ?? 'Maximum processing attempts exhausted',
+        },
+      });
+      return this.statusForVersion(versionId);
+    }
+
+    const workerId = randomUUID();
+    const claim = await this.prisma.processingJob.updateMany({
+      where: {
+        id: job.id,
+        status: job.status,
+        ...(job.status === ProcessingJobStatus.RUNNING ? { lockedAt: { lte: staleBefore } } : {}),
+      },
+      data: {
+        status: ProcessingJobStatus.RUNNING,
+        attempts: { increment: 1 },
+        startedAt: now,
+        completedAt: null,
+        lockedAt: now,
+        lockedBy: workerId,
+      },
+    });
+    if (claim.count !== 1) return this.statusForVersion(versionId);
+
+    const attempt = job.attempts + 1;
+    await this.audit.append({
+      action: 'OCR_STARTED', entityType: 'document_version', entityId: versionId,
+      caseId: version.document.caseId, documentId: version.documentId, versionId,
+      metadata: { jobId: job.id, attempt, maxAttempts: job.maxAttempts },
+    });
+
+    let failureStage: 'STORAGE' | 'DECRYPTION' | 'PROCESSING' = 'STORAGE';
     try {
       const encrypted = await this.storage.get(version.storageKey);
+      failureStage = 'DECRYPTION';
       const bytes = this.encryption.decrypt(encrypted, version.storageKey);
+      failureStage = 'PROCESSING';
       const workerResult = this.ocrClient.configured() ? await this.ocrClient.process(versionId, version.mimeType, bytes) : null;
       const extracted = workerResult
         ? { text: workerResult.text, pageCount: workerResult.page_count, engine: workerResult.engine }
@@ -55,11 +114,50 @@ export class IntelligenceService {
           update: { summary: extracted.text.slice(0, 600), model: 'extractive-prototype' },
         });
       }
-      await this.prisma.processingJob.update({ where: { id: job.id }, data: { status: 'COMPLETED', completedAt: new Date(), error: null } });
-      await this.audit.append({ action: 'OCR_COMPLETED', entityType: 'document_version', entityId: versionId, caseId: version.document.caseId, documentId: version.documentId, versionId, metadata: { engine: extracted.engine, pageCount: extracted.pageCount } });
+      await this.prisma.processingJob.update({
+        where: { id: job.id },
+        data: {
+          status: ProcessingJobStatus.SUCCEEDED,
+          completedAt: new Date(),
+          lockedAt: null,
+          lockedBy: null,
+          lastError: null,
+        },
+      });
+      await this.audit.append({
+        action: 'OCR_COMPLETED', entityType: 'document_version', entityId: versionId,
+        caseId: version.document.caseId, documentId: version.documentId, versionId,
+        metadata: { jobId: job.id, attempt, engine: extracted.engine, pageCount: extracted.pageCount },
+      });
       return result;
     } catch (error) {
-      await this.prisma.processingJob.update({ where: { id: job.id }, data: { status: 'FAILED', error: error instanceof Error ? error.message.slice(0, 500) : 'Processing failed', completedAt: new Date() } });
+      const retryable = failureStage !== 'DECRYPTION';
+      const exhausted = attempt >= job.maxAttempts;
+      const status = !retryable
+        ? ProcessingJobStatus.FAILED
+        : exhausted
+          ? ProcessingJobStatus.DEAD
+          : ProcessingJobStatus.RETRY_PENDING;
+      const terminal = status === ProcessingJobStatus.FAILED || status === ProcessingJobStatus.DEAD;
+      const retryAt = new Date(Date.now() + this.retryBaseDelayMs * 2 ** Math.max(0, attempt - 1));
+      await this.prisma.processingJob.update({
+        where: { id: job.id },
+        data: {
+          status,
+          lastError: this.safeProcessingError(failureStage, error),
+          nextAttemptAt: terminal ? now : retryAt,
+          completedAt: terminal ? new Date() : null,
+          lockedAt: null,
+          lockedBy: null,
+        },
+      });
+      await this.audit.append({
+        action: status === ProcessingJobStatus.RETRY_PENDING ? 'OCR_RETRY_SCHEDULED' : 'OCR_PROCESSING_TERMINATED',
+        entityType: 'document_version', entityId: versionId,
+        caseId: version.document.caseId, documentId: version.documentId, versionId,
+        result: 'FAILURE',
+        metadata: { jobId: job.id, attempt, maxAttempts: job.maxAttempts, stage: failureStage, status },
+      });
       throw error;
     }
   }
@@ -67,6 +165,7 @@ export class IntelligenceService {
   async run(documentId: string, user: AuthenticatedUser, requestedVersionId?: string) {
     const document = await this.authorization.authorize(documentId, user, DocumentPermission.EDIT);
     const versionId = requestedVersionId ?? document.currentVersionId;
+    await this.audit.append({ userId: user.id, action: 'OCR_PROCESSING_REQUESTED', entityType: 'document', entityId: documentId, caseId: document.caseId, documentId, versionId });
     if (versionId) {
       const existing = await this.prisma.ocrResult.findUnique({ where: { documentVersionId: versionId } });
       // Older builds could persist the PDF container itself as "extracted" text.
@@ -77,16 +176,68 @@ export class IntelligenceService {
           this.prisma.ocrResult.delete({ where: { documentVersionId: versionId } }),
         ]);
       }
-      const pending = await this.prisma.processingJob.findFirst({ where: { documentVersionId: versionId, type: 'OCR', status: 'PENDING' } });
-      if (!pending) await this.prisma.processingJob.create({ data: { documentVersionId: versionId, type: 'OCR' } });
+      const active = await this.prisma.processingJob.findFirst({
+        where: {
+          documentVersionId: versionId,
+          type: 'OCR',
+          status: { in: [ProcessingJobStatus.QUEUED, ProcessingJobStatus.RUNNING, ProcessingJobStatus.RETRY_PENDING] },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (active?.status === ProcessingJobStatus.RETRY_PENDING) {
+        await this.prisma.processingJob.update({
+          where: { id: active.id },
+          data: { status: ProcessingJobStatus.QUEUED, nextAttemptAt: new Date() },
+        });
+      } else if (!active) {
+        try {
+          await this.prisma.processingJob.create({ data: { documentVersionId: versionId, type: 'OCR' } });
+        } catch (error) {
+          if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')) throw error;
+        }
+      }
       await this.processVersion(versionId);
     }
-    await this.audit.append({ userId: user.id, action: 'OCR_PROCESSING_REQUESTED', entityType: 'document', entityId: documentId, caseId: document.caseId, documentId, versionId });
     return this.status(documentId, user, versionId ?? undefined);
   }
 
   private async statusForVersion(versionId: string) {
     return this.prisma.ocrResult.findUnique({ where: { documentVersionId: versionId } });
+  }
+
+  private jobView(job: {
+    id: string;
+    type: string;
+    status: ProcessingJobStatus;
+    attempts: number;
+    maxAttempts: number;
+    nextAttemptAt: Date;
+    lastError: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+    startedAt: Date | null;
+    completedAt: Date | null;
+  }) {
+    return {
+      id: job.id,
+      type: job.type,
+      status: job.status,
+      attempts: job.attempts,
+      maxAttempts: job.maxAttempts,
+      nextAttemptAt: job.nextAttemptAt,
+      lastError: job.lastError,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+    };
+  }
+
+  private safeProcessingError(stage: 'STORAGE' | 'DECRYPTION' | 'PROCESSING', error: unknown) {
+    if (stage === 'STORAGE') return 'Stored encrypted object could not be read';
+    if (stage === 'DECRYPTION') return 'Stored document failed authenticated decryption';
+    const message = error instanceof Error ? error.message : '';
+    return message.startsWith('OCR service ') ? message.slice(0, 500) : 'Document processing failed';
   }
 
   private extract(bytes: Buffer, mimeType: string) {
@@ -110,9 +261,17 @@ export class SearchService {
   async search(filters: SearchFilters, user: AuthenticatedUser) {
     const q = filters.q.trim();
     const principal = [{ userId: user.id }, ...(user.departmentId ? [{ departmentId: user.departmentId }] : [])];
-    const scope: Prisma.DocumentWhereInput = user.role === 'ADMIN' || user.role === 'AUDITOR'
-      ? {}
-      : { OR: [{ createdById: user.id }, { permissions: { some: { status: 'ACTIVE', OR: principal } } }] };
+    const now = new Date();
+    const scope: Prisma.DocumentWhereInput = {
+      classification: { in: allowedClassifications(user) },
+      ...(user.role === 'AUDITOR' ? {} : { OR: [
+        { createdById: user.id },
+        { permissions: { some: {
+          status: 'ACTIVE', validFrom: { lte: now },
+          AND: [{ OR: principal }, { OR: [{ validUntil: null }, { validUntil: { gt: now } }] }],
+        } } },
+      ] }),
+    };
     const ocrTextFilter = { contains: q, mode: Prisma.QueryMode.insensitive };
     const queryFilter: Prisma.DocumentWhereInput = q ? {
       OR: [
@@ -144,6 +303,8 @@ export class SearchService {
         id: record.id,
         title: record.title,
         documentType: record.documentType,
+        classification: record.classification,
+        recordStatus: record.recordStatus,
         case: record.case,
         version: matchedVersion ? { id: matchedVersion.id, number: matchedVersion.versionNumber } : null,
         matchedText: matchedText ? this.snippet(matchedText, q) : null,

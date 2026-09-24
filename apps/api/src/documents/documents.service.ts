@@ -7,8 +7,10 @@ import {
 import {
   AuditResult,
   DocumentPermission,
+  DocumentClassification,
   DocumentVersion,
   Prisma,
+  VersionKind,
 } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import type { AuthenticatedUser } from '../common/auth-user';
@@ -22,6 +24,9 @@ import { CreateDocumentDto } from './dto/create-document.dto';
 import { CreateVersionDto } from './dto/create-version.dto';
 import { GrantAccessDto } from './dto/grant-access.dto';
 import { FileValidationService } from './file-validation.service';
+import { CustodyService } from './custody.service';
+import { canAccessClassification, allowedClassifications } from './document-policy';
+import { RevokeAccessDto } from './dto/records.dto';
 
 const documentInclude = {
   case: { select: { id: true, caseNumber: true, title: true } },
@@ -42,6 +47,7 @@ export class DocumentsService {
     private readonly encryption: EncryptionService,
     private readonly storage: StorageService,
     private readonly audit: AuditService,
+    private readonly custody: CustodyService,
   ) {}
 
   async list(caseId: string, user: AuthenticatedUser) {
@@ -51,15 +57,21 @@ export class DocumentsService {
       { userId: user.id },
       ...(user.departmentId ? [{ departmentId: user.departmentId }] : []),
     ];
-    const accessWhere: Prisma.DocumentWhereInput =
-      user.role === 'ADMIN' || user.role === 'AUDITOR'
-        ? {}
-        : {
+    const now = new Date();
+    const accessWhere: Prisma.DocumentWhereInput = {
+      classification: { in: allowedClassifications(user) },
+      AND: [
+        user.role === 'AUDITOR' ? {} : {
             OR: [
               { createdById: user.id },
-              { permissions: { some: { status: 'ACTIVE', OR: principal } } },
+              { permissions: { some: {
+                status: 'ACTIVE', validFrom: { lte: now },
+                AND: [{ OR: principal }, { OR: [{ validUntil: null }, { validUntil: { gt: now } }] }],
+              } } },
             ],
-          };
+          },
+      ],
+    };
     const records = await this.prisma.document.findMany({
       where: { caseId, ...accessWhere },
       include: documentInclude,
@@ -85,6 +97,10 @@ export class DocumentsService {
     ipAddress?: string,
   ) {
     const caseRecord = await this.cases.findOne(dto.caseId, user);
+    const classification = dto.classification ?? DocumentClassification.RESTRICTED;
+    if (!canAccessClassification(user, classification)) {
+      throw new BadRequestException('Your role cannot create a document at this classification');
+    }
     const validated = this.validator.validate(file);
     const documentId = randomUUID();
     const versionId = randomUUID();
@@ -101,6 +117,7 @@ export class DocumentsService {
             caseId: dto.caseId,
             title: dto.title.trim(),
             documentType: dto.documentType.trim().toUpperCase(),
+            classification,
             ownerDepartmentId: caseRecord.department.id,
             createdById: user.id,
           },
@@ -117,6 +134,8 @@ export class DocumentsService {
             originalFilename: validated.originalFilename,
             createdById: user.id,
             changeDescription: 'Initial upload',
+            versionKind: VersionKind.ORIGINAL,
+            isAuthoritative: true,
           },
         });
         await tx.document.update({ where: { id: documentId }, data: { currentVersionId: versionId } });
@@ -135,6 +154,10 @@ export class DocumentsService {
           },
           tx,
         );
+        await this.custody.append({
+          category: 'CUSTODY', type: 'UPLOADED', caseId: dto.caseId, documentId,
+          versionId, actorId: user.id, details: { versionNumber: 1, versionKind: VersionKind.ORIGINAL, sha256Hash },
+        }, tx);
       });
     } catch (error) {
       await this.cleanup(storageKey);
@@ -151,6 +174,15 @@ export class DocumentsService {
     ipAddress?: string,
   ) {
     const document = await this.authorization.authorize(documentId, user, DocumentPermission.EDIT);
+    const versionKind = dto.versionKind ?? VersionKind.REVISION;
+    const isDerived = versionKind === VersionKind.DERIVED || versionKind === VersionKind.REDACTED;
+    if (isDerived !== Boolean(dto.sourceVersionId)) {
+      throw new BadRequestException('DERIVED and REDACTED versions require sourceVersionId; revisions must not provide it');
+    }
+    if (dto.sourceVersionId) {
+      const source = await this.prisma.documentVersion.findFirst({ where: { id: dto.sourceVersionId, documentId } });
+      if (!source) throw new NotFoundException('Source version not found in this document');
+    }
     const validated = this.validator.validate(file);
     const versionId = randomUUID();
     const storageKey = this.storageKey(document.caseId, documentId, versionId);
@@ -177,6 +209,11 @@ export class DocumentsService {
             originalFilename: validated.originalFilename,
             createdById: user.id,
             changeDescription: dto.changeDescription?.trim(),
+            versionKind,
+            parentVersionId: document.currentVersionId,
+            sourceVersionId: dto.sourceVersionId,
+            isAuthoritative: !isDerived,
+            transformationType: dto.transformationType?.trim(),
           },
         });
         await tx.document.update({ where: { id: documentId }, data: { currentVersionId: versionId } });
@@ -195,6 +232,11 @@ export class DocumentsService {
           },
           tx,
         );
+        await this.custody.append({
+          category: 'CUSTODY', type: isDerived ? 'DERIVED' : 'UPLOADED', caseId: document.caseId,
+          documentId, versionId, actorId: user.id,
+          details: { versionNumber, versionKind, parentVersionId: document.currentVersionId, sourceVersionId: dto.sourceVersionId ?? null },
+        }, tx);
         return version;
       });
     } catch (error) {
@@ -261,6 +303,10 @@ export class DocumentsService {
       result: verified ? AuditResult.SUCCESS : AuditResult.FAILURE,
       metadata: { expectedHash: version.sha256Hash, reason },
     });
+    await this.custody.append({
+      category: 'CUSTODY', type: 'VERIFIED', caseId: document.caseId, documentId,
+      versionId: version.id, actorId: user.id, details: { verified, reason },
+    });
     return {
       status: verified ? 'VERIFIED' : 'MISMATCH',
       versionId: version.id,
@@ -275,6 +321,9 @@ export class DocumentsService {
     if (Boolean(dto.departmentId) === Boolean(dto.userId)) {
       throw new BadRequestException('Provide exactly one of departmentId or userId');
     }
+    const validFrom = dto.validFrom ? new Date(dto.validFrom) : new Date();
+    const validUntil = dto.validUntil ? new Date(dto.validUntil) : null;
+    if (validUntil && validUntil <= validFrom) throw new BadRequestException('validUntil must be later than validFrom');
     if (dto.departmentId && !(await this.prisma.department.findUnique({ where: { id: dto.departmentId } }))) {
       throw new NotFoundException('Department not found');
     }
@@ -290,16 +339,26 @@ export class DocumentsService {
         status: 'ACTIVE',
       },
     });
-    if (existing) throw new ConflictException('This permission is already active');
+    if (existing) {
+      if (existing.validUntil && existing.validUntil <= new Date()) {
+        await this.prisma.documentPermissionGrant.update({ where: { id: existing.id }, data: { status: 'EXPIRED' } });
+      } else {
+        throw new ConflictException('This permission is already active');
+      }
+    }
 
-    return this.prisma.$transaction(async (tx) => {
-      const permission = await tx.documentPermissionGrant.create({
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const permission = await tx.documentPermissionGrant.create({
         data: {
           documentId,
           departmentId: dto.departmentId,
           userId: dto.userId,
           permission: dto.permission,
           grantedById: user.id,
+          reason: dto.reason?.trim(),
+          validFrom,
+          validUntil,
         },
         include: {
           department: { select: { id: true, name: true, code: true } },
@@ -318,25 +377,42 @@ export class DocumentsService {
             permission: dto.permission,
             departmentId: dto.departmentId ?? null,
             userId: dto.userId ?? null,
+            reason: dto.reason ?? null,
+            validFrom: validFrom.toISOString(),
+            validUntil: validUntil?.toISOString() ?? null,
           },
         },
         tx,
       );
-      return permission;
-    });
+      await this.custody.append({
+        category: 'ACCESS', type: 'ACCESS_GRANTED', caseId: document.caseId, documentId,
+        actorId: user.id, details: { permissionId: permission.id, permission: dto.permission, reason: dto.reason ?? null },
+      }, tx);
+        return permission;
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('This permission is already active');
+      }
+      throw error;
+    }
   }
 
-  async revokeAccess(documentId: string, permissionId: string, user: AuthenticatedUser) {
+  async revokeAccess(documentId: string, permissionId: string, dto: RevokeAccessDto, user: AuthenticatedUser) {
     const document = await this.authorization.authorize(documentId, user, DocumentPermission.SHARE);
-    const grant = await this.prisma.documentPermissionGrant.findFirst({
-      where: { id: permissionId, documentId, status: 'ACTIVE' },
-    });
-    if (!grant) throw new NotFoundException('Active permission not found');
+    const grant = await this.prisma.documentPermissionGrant.findFirst({ where: { id: permissionId, documentId } });
+    if (!grant) throw new NotFoundException('Permission not found');
     return this.prisma.$transaction(async (tx) => {
-      const revoked = await tx.documentPermissionGrant.update({
-        where: { id: permissionId },
-        data: { status: 'REVOKED', revokedAt: new Date() },
+      const claimed = await tx.documentPermissionGrant.updateMany({
+        where: { id: permissionId, documentId, status: 'ACTIVE', revision: dto.expectedRevision },
+        data: {
+          status: 'REVOKED', revokedAt: new Date(), revokedById: user.id,
+          revokeReason: dto.reason.trim(), revision: { increment: 1 },
+        },
       });
+      if (claimed.count !== 1) {
+        throw new ConflictException('Permission changed since it was loaded; refresh and retry');
+      }
       await this.audit.append(
         {
           userId: user.id,
@@ -345,11 +421,15 @@ export class DocumentsService {
           entityId: permissionId,
           caseId: document.caseId,
           documentId,
-          metadata: { permission: grant.permission, departmentId: grant.departmentId, userId: grant.userId },
+          metadata: { permission: grant.permission, departmentId: grant.departmentId, userId: grant.userId, reason: dto.reason },
         },
         tx,
       );
-      return revoked;
+      await this.custody.append({
+        category: 'ACCESS', type: 'ACCESS_REVOKED', caseId: document.caseId, documentId,
+        actorId: user.id, details: { permissionId, permission: grant.permission, reason: dto.reason },
+      }, tx);
+      return tx.documentPermissionGrant.findUniqueOrThrow({ where: { id: permissionId } });
     });
   }
 
@@ -361,6 +441,7 @@ export class DocumentsService {
         department: { select: { id: true, name: true, code: true } },
         user: { select: { id: true, name: true, email: true } },
         grantedBy: { select: { id: true, name: true } },
+        revokedBy: { select: { id: true, name: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -380,12 +461,17 @@ export class DocumentsService {
 
   async securityStats(user: AuthenticatedUser) {
     const principal = [{ userId: user.id }, ...(user.departmentId ? [{ departmentId: user.departmentId }] : [])];
-    const scope: Prisma.DocumentWhereInput = user.role === 'ADMIN' || user.role === 'AUDITOR'
-      ? {}
-      : { OR: [{ createdById: user.id }, { permissions: { some: { status: 'ACTIVE', OR: principal } } }] };
+    const now = new Date();
+    const scope: Prisma.DocumentWhereInput = {
+      classification: { in: allowedClassifications(user) },
+      ...(user.role === 'AUDITOR' ? {} : { OR: [
+        { createdById: user.id },
+        { permissions: { some: { status: 'ACTIVE', validFrom: { lte: now }, AND: [{ OR: principal }, { OR: [{ validUntil: null }, { validUntil: { gt: now } }] }] } } },
+      ] }),
+    };
     const [documents, jobs, auditEvents] = await Promise.all([
       this.prisma.document.count({ where: scope }),
-      this.prisma.processingJob.count({ where: { status: { in: ['PENDING', 'PROCESSING'] }, documentVersion: { document: scope } } }),
+      this.prisma.processingJob.count({ where: { status: { in: ['QUEUED', 'RUNNING', 'RETRY_PENDING'] }, documentVersion: { document: scope } } }),
       this.prisma.auditEvent.count({ where: { document: scope } }),
     ]);
     return { documents, processing: jobs, auditEvents, encryption: 'AES-256-GCM' };
@@ -442,6 +528,11 @@ export class DocumentsService {
       ipAddress,
       metadata: { versionNumber: version.versionNumber },
     });
+    await this.custody.append({
+      category: 'CUSTODY', type: action === 'DOCUMENT_DOWNLOADED' ? 'DOWNLOADED' : 'ACCESSED',
+      caseId: document.caseId, documentId: document.id, versionId: version.id, actorId: user.id,
+      details: { versionNumber: version.versionNumber },
+    });
     return { bytes, version: this.versionView(version) };
   }
 
@@ -470,6 +561,11 @@ export class DocumentsService {
       mimeType: version.mimeType,
       originalFilename: version.originalFilename,
       changeDescription: version.changeDescription,
+      versionKind: version.versionKind,
+      parentVersionId: version.parentVersionId,
+      sourceVersionId: version.sourceVersionId,
+      isAuthoritative: version.isAuthoritative,
+      transformationType: version.transformationType,
       createdAt: version.createdAt,
       ...(version.creator ? { creator: version.creator } : {}),
     };

@@ -12,7 +12,7 @@ Request → JWT authentication → role guard → current database resource perm
 
 Implemented core behavior includes authentication, RBAC, cases, departments, explicit case membership, validated document upload/download/preview, AES-256-GCM encryption, SHA-256 integrity checks, application-level append-only versions, document sharing/revocation, audit logging, OCR/text extraction integration, permission-scoped keyword search, prototype summaries, dashboard/case/document/search UI, Swagger, tests, linting and builds.
 
-This is a hardened hackathon MVP under active verification, not a production-ready legal records system. Upload quarantine/malware scanning, storage-enforced WORM, protected audit archives, legal hold, explicit custody provenance, KMS/HSM, MFA/identity federation and tested disaster recovery are not implemented. See [implementation-verification.md](implementation-verification.md) for claim-by-claim evidence.
+This is a hardened hackathon MVP under active verification, not a production-ready legal records system. Phase 2 adds prototype classification clearance, evidence-version lineage, custody events, legal holds, record lifecycle and time-bounded grants. Upload quarantine/malware scanning, storage-enforced WORM, protected audit archives, KMS/HSM, MFA/identity federation and tested disaster recovery are not implemented. See [implementation-verification.md](implementation-verification.md) for claim-by-claim Phase 1 evidence and [reports/phase-2-hardening-report.md](reports/phase-2-hardening-report.md) for the Phase 2 gate.
 
 Semantic search, real LLM integration, distributed processing queues, KMS/Vault and production deployment automation remain future hardening work.
 
@@ -47,7 +47,7 @@ Start PDF/image OCR separately:
 
 Set `OCR_SERVICE_URL=http://localhost:8000` when the worker is running and configure the same 32-character-or-longer `OCR_INTERNAL_TOKEN` for API and worker. Document access remains available if OCR is offline; processing can be retried later.
 
-Useful commands are npm run build, npm test, npm run test:web, npm run lint and npm run infra:down.
+Useful commands are npm run build, npm test, npm run test:integration, npm run test:web, npm run lint and npm run infra:down. The integration command uses isolated ephemeral PostgreSQL/MinIO services and `npm run infra:test:down` removes them.
 
 ## 4. Infrastructure and configuration
 
@@ -79,9 +79,11 @@ Prisma migrations cover foundation, secure documents and intelligence tables. db
 
 ### Documents
 
-- documents: case, title, document type, owning department, creator and current-version pointer.
-- document_versions: append-only application version number, storage key, SHA-256, size, MIME type, original filename, creator and change description.
-- document_permissions: optional user or department target, permission, active/revoked status, grantor and revoke timestamp.
+- documents: case, controlled type, prototype classification, record status, owning department, creator and current-version pointer.
+- document_versions: append-only number, version kind, parent/source lineage, authority flag, storage metadata, SHA-256 and creator.
+- document_permissions: user/department principal, capability, active/revoked/expired status, validity period, grant/revoke actors and reasons.
+- custody_events: typed technical provenance linked to case/document/version/actor.
+- legal_holds: document hold reason/reference and place/release history.
 
 ### Audit and intelligence
 
@@ -109,13 +111,14 @@ Authorization has two layers:
 
 Implemented policy:
 
-- ADMIN manages users/departments and currently bypasses document grants. This requires separation-of-duties review; platform administration should not automatically imply evidence access in a production policy.
+- ADMIN manages platform identities/reference data but no longer automatically accesses or uploads evidence.
 - AUDITOR has read-only audit/relevant-record access.
 - Investigators and senior officers may create cases subject to resource rules.
 - Department heads are scoped to their department.
 - Investigators require explicit case membership or document grant.
 - VIEW, DOWNLOAD, EDIT and SHARE are independent capabilities.
-- REVOKED grants never satisfy an authorization query.
+- REVOKED, EXPIRED, not-yet-active and time-expired grants never satisfy an authorization query.
+- Prototype role clearance must cover INTERNAL, RESTRICTED, CONFIDENTIAL or HIGHLY_RESTRICTED document classification.
 
 Frontend button visibility is not security. Direct IDs, altered case IDs and unauthorized search queries are checked by the API.
 
@@ -143,6 +146,10 @@ All routes are prefixed with /api.
 | GET/POST | /documents/:id/access | List/grant with SHARE |
 | DELETE | /documents/:id/access/:permissionId | Revoke with SHARE |
 | GET | /documents/:id/audit | Authorized audit history |
+| GET | /documents/:id/provenance | VIEW-scoped custody/provenance history |
+| GET/POST | /documents/:id/holds | View/place legal holds |
+| POST | /documents/:id/holds/:holdId/release | Release an active hold with reason |
+| POST | /documents/:id/record-status | APPROVE-scoped lifecycle transition |
 | GET | /documents/:id/intelligence | OCR/summary/job status |
 | POST | /documents/:id/process | Process/retry selected version |
 | GET | /search?q=... | Permission-scoped keyword search |
@@ -169,13 +176,15 @@ The API never returns a public storage URL. It authorizes first, reads ciphertex
 
 ### Versioning
 
-An update inserts version N+1 and updates current_version_id; normal application routes do not overwrite older rows or objects. Historical versions support metadata, preview, download, extraction, summary and verification. This is application-level append-only behavior, not storage-enforced immutability/WORM; privileged database or MinIO operators remain able to alter data.
+An update inserts version N+1 and updates current_version_id; normal application routes do not overwrite older rows or objects. Version 1 is ORIGINAL. Later versions are REVISION by default or DERIVED/REDACTED with an explicit source-version relationship. Historical versions support metadata, preview, download, extraction, summary and verification. This is application-level append-only behavior, not storage-enforced immutability/WORM.
 
 ## 10. Sharing and audit
 
-A caller with SHARE authority can grant a user or department a specific permission. VIEW does not imply DOWNLOAD. Grant and revoke are immediately reflected in authorization queries.
+A caller with SHARE authority can grant a user or department a specific permission with reason and optional validity window. VIEW does not imply DOWNLOAD. Activation, expiry and revocation are immediately reflected in authorization queries.
 
 Audit actions include login outcomes, case creation, upload, view, download, version creation, grant/revoke, denied access, integrity results, OCR lifecycle and search. Each event stores `previous_hash` and `event_hash`, creating hash linkage. There is no normal-user audit update/delete endpoint, but no chain verifier or independently protected append-only archive exists. The audit store is therefore not immutable and must not yet be described as independently tamper-evident.
+
+Mutating evidence/records endpoints support a database-backed `Idempotency-Key`. The ledger is scoped by user and operation, fingerprints request DTO/file content, rejects key reuse with changed input, and replays completed responses. In-progress collisions return `409`. This reduces duplicate operations but is not a transactional outbox: a crash after the domain commit and before replay-response persistence can leave the key claimed until expiry and requires reconciliation.
 
 ## 11. OCR, extraction and summaries
 
@@ -183,7 +192,9 @@ The FastAPI worker receives service-token-authenticated base64 bytes and a versi
 
 For PDFs, PyMuPDF extracts embedded page text first. Empty or PDF-container-like output beginning with %PDF- is rejected as false text; pages are rendered and PaddleOCR is attempted. Text/Markdown uses UTF-8 extraction and images use PaddleOCR.
 
-The API stores results in ocr_results and lifecycle state in processing_jobs. A stale raw %PDF-1.7 result is detected and removed before retry. Extract text & summarize requeues completed jobs so an older stale result can be replaced after the worker starts.
+The API stores results in ocr_results and durable lifecycle state in processing_jobs. Jobs use QUEUED, RUNNING, SUCCEEDED, RETRY_PENDING, FAILED and DEAD states with maximum attempts, retry timing, atomic claims and reclaimable leases. A stale raw %PDF-1.7 result is detected and removed before retry. Extract text & summarize requeues completed jobs so an older stale result can be replaced after the worker starts.
+
+Processing remains request-triggered and synchronous; no continuously polling dispatcher currently executes due retries automatically. See [failure-modes.md](failure-modes.md).
 
 The current summary is an extractive prototype: up to 600 characters of extracted text stored in ai_summaries with model extractive-prototype. It is separate from the original file and searchable text and never modifies source bytes.
 
@@ -206,9 +217,11 @@ AppShell provides navigation, active-route semantics and sign-out. The UI was re
 
 ## 14. Tests and quality
 
-API regression tests cover correct/wrong login, inactive users, missing/invalid/expired tokens, roles, case membership, cross-department case denial, upload validation, path-like filenames, encrypted lifecycle, permission separation, grants, downloads, versions, revocation and tamper-detected integrity mismatch. These suites start the Nest application but replace Prisma and MinIO with mocks, so they are not full infrastructure end-to-end tests.
+API regression tests cover authentication, roles, case scope, upload validation, encryption lifecycle, capability separation, grant expiry/revocation, evidence lineage, administrator separation of duties, legal-hold disposition denial, custody events and integrity mismatch. These suites start Nest but replace Prisma and MinIO with mocks, so they are not full infrastructure end-to-end tests.
 
-Playwright covers an admin login and dashboard flow. Standard checks:
+Phase 3 adds an isolated real-infrastructure journey using separate PostgreSQL and MinIO containers. The test verifies all nine migrations, encrypted object persistence, database-backed authorization, exact-secret search isolation, VIEW versus DOWNLOAD separation, immediate revocation, integrity verification, audit/custody creation, idempotent replay and stale lifecycle rejection. This is meaningful integration coverage, but not yet a complete dependency-failure suite.
+
+Playwright covers login, responsive navigation/layout and an investigator golden path through upload, versions, extraction, permission isolation/revocation, provenance and legal-hold disposition denial. Standard checks:
 
     npm test
     npm run test:web
@@ -237,7 +250,7 @@ Only fictional data should be used.
 - KMS/Vault key storage, rotation and envelope-key policy.
 - Managed PostgreSQL/S3, backups, retention and object lock.
 - Malware scanning and content disarmament.
-- Durable queue, retries, idempotency and isolated OCR/AI workers.
+- Autonomous job dispatch, lease heartbeat, idempotency reconciliation and stronger OCR/AI isolation.
 - Real LLM integration with constrained prompts and model/output audit metadata.
 - Embeddings, pgvector and hybrid search if stable.
 - Centralized logs/SIEM, metrics, alerting and shared rate limiting.
@@ -248,18 +261,21 @@ Only fictional data should be used.
 
 | Area | Status |
 | --- | --- |
-| Foundation, migrations and seeds | MVP complete; disposable-DB migration test absent |
+| Foundation, migrations and seeds | MVP complete; all nine migrations verified on a disposable PostgreSQL database |
 | Authentication and RBAC | MVP complete; MFA/IdP/session revocation absent |
 | Cases, departments and membership | MVP complete |
 | Encrypted document storage | MVP complete; KMS/envelope keys absent |
 | SHA-256 verification | MVP complete |
 | Append-only versions | MVP complete at application layer; WORM absent |
-| Grant/revoke | MVP complete; expiry/reason metadata absent |
+| Grant/revoke/expiry | MVP complete; active-grant uniqueness and stale revocation protected in PostgreSQL |
+| Version provenance semantics | MVP complete in code; legal-policy review required |
+| Legal hold / record lifecycle | MVP complete as logical controls; no storage retention/purge |
+| Custody-event tracking | MVP complete; not a claim of legally sufficient chain of custody |
+| Prototype classification | Partial; role-based taxonomy only |
 | Hash-linked audit | Partial; verifier/protected archive absent |
 | PDF/text/image extraction integration | Partial; representative PDF/OCR corpus not yet passing |
 | Permission-scoped keyword search | MVP complete; real-DB automated isolation test absent |
 | Prototype extractive summary | Experimental |
 | Malware scanning/quarantine | Not implemented |
-| Legal hold/provenance/record lifecycle | Not implemented |
 | Semantic search/embeddings | Deferred |
 | Production key management/deployment/DR | Production hardening required |

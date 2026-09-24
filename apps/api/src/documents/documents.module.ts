@@ -12,6 +12,10 @@ import { IntelligenceController } from './intelligence.controller';
 import { IntelligenceService, SearchService } from './intelligence.service';
 import { OcrClientService } from './ocr-client.service';
 import { FileValidationService } from './file-validation.service';
+import { CustodyService } from './custody.service';
+import { RecordsController } from './records.controller';
+import { RecordsService } from './records.service';
+import { IdempotencyService } from '../common/idempotency.service';
 
 @Module({
   imports: [
@@ -25,8 +29,8 @@ import { FileValidationService } from './file-validation.service';
       }),
     }),
   ],
-  controllers: [DocumentsController, IntelligenceController],
-  providers: [DocumentsService, DocumentAuthorizationService, FileValidationService, IntelligenceService, SearchService, OcrClientService, RolesGuard],
+  controllers: [DocumentsController, IntelligenceController, RecordsController],
+  providers: [DocumentsService, DocumentAuthorizationService, FileValidationService, IntelligenceService, SearchService, OcrClientService, CustodyService, RecordsService, IdempotencyService, RolesGuard],
   exports: [IntelligenceService, SearchService],
 })
 export class DocumentsModule {}

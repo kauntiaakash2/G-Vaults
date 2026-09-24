@@ -10,11 +10,14 @@ export class ApiError extends Error {
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = typeof window !== 'undefined' ? sessionStorage.getItem(TOKEN_KEY) : null;
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+  const method = (options.method ?? 'GET').toUpperCase();
+  const mutatesState = !['GET', 'HEAD', 'OPTIONS'].includes(method);
   const response = await fetch(`${API_URL}${path}`, {
     ...options,
     headers: {
       ...(!isFormData ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(mutatesState && typeof crypto !== 'undefined' ? { 'Idempotency-Key': crypto.randomUUID() } : {}),
       ...options.headers,
     },
   });

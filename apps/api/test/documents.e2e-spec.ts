@@ -13,6 +13,7 @@ const ids = {
   owner: '11000000-0000-4000-8000-000000000001',
   viewer: '11000000-0000-4000-8000-000000000002',
   outsider: '11000000-0000-4000-8000-000000000003',
+  admin: '11000000-0000-4000-8000-000000000004',
   ownerDepartment: '21000000-0000-4000-8000-000000000001',
   viewerDepartment: '21000000-0000-4000-8000-000000000002',
   outsiderDepartment: '21000000-0000-4000-8000-000000000003',
@@ -24,6 +25,7 @@ describe('Phase 2 document security API (e2e)', () => {
   let ownerToken: string;
   let viewerToken: string;
   let outsiderToken: string;
+  let adminToken: string;
   let documentId: string;
   let permissionId: string;
   let firstVersionId: string;
@@ -32,6 +34,8 @@ describe('Phase 2 document security API (e2e)', () => {
   const versions: any[] = [];
   const grants: any[] = [];
   const auditEvents: any[] = [];
+  const custodyEvents: any[] = [];
+  const legalHolds: any[] = [];
   const jobs: any[] = [];
 
   beforeAll(async () => {
@@ -50,6 +54,7 @@ describe('Phase 2 document security API (e2e)', () => {
       user(ids.owner, 'owner@sih.local', ids.ownerDepartment, passwordHash),
       user(ids.viewer, 'viewer@sih.local', ids.viewerDepartment, passwordHash),
       user(ids.outsider, 'outsider@sih.local', ids.outsiderDepartment, passwordHash),
+      user(ids.admin, 'platform-admin@sih.local', ids.ownerDepartment, passwordHash, 'ADMIN'),
     ];
     const caseRecord = {
       id: ids.case,
@@ -83,7 +88,7 @@ describe('Phase 2 document security API (e2e)', () => {
       },
       document: {
         create: jest.fn(({ data }: any) => {
-          const record = { ...data, currentVersionId: null, createdAt: new Date(), updatedAt: new Date() };
+          const record = { classification: 'RESTRICTED', recordStatus: 'DRAFT', revision: 0, ...data, currentVersionId: null, createdAt: new Date(), updatedAt: new Date() };
           documents.push(record);
           caseRecord._count.documents += 1;
           return Promise.resolve(record);
@@ -93,14 +98,26 @@ describe('Phase 2 document security API (e2e)', () => {
           Object.assign(record, data, { updatedAt: new Date() });
           return Promise.resolve(record);
         }),
+        updateMany: jest.fn(({ where, data }: any) => {
+          const record = documents.find((item) => item.id === where.id && (where.revision === undefined || item.revision === where.revision));
+          if (!record) return Promise.resolve({ count: 0 });
+          if (data.recordStatus !== undefined) record.recordStatus = data.recordStatus;
+          if (data.revision?.increment) record.revision += data.revision.increment;
+          record.updatedAt = new Date();
+          return Promise.resolve({ count: 1 });
+        }),
         findUnique: jest.fn(({ where, include }: any) => Promise.resolve(hydrateDocument(where.id, include))),
+        findUniqueOrThrow: jest.fn(({ where }: any) => {
+          const record = documents.find((item) => item.id === where.id);
+          return record ? Promise.resolve(record) : Promise.reject(new Error('Document not found'));
+        }),
         findMany: jest.fn(({ where }: any) => Promise.resolve(
           documents.filter((item) => item.caseId === where.caseId).map((item) => hydrateDocument(item.id, {})),
         )),
       },
       documentVersion: {
         create: jest.fn(({ data }: any) => {
-          const record = { ...data, createdAt: new Date() };
+          const record = { versionKind: 'REVISION', parentVersionId: null, sourceVersionId: null, isAuthoritative: true, transformationType: null, ...data, createdAt: new Date() };
           versions.push(record);
           return Promise.resolve(record);
         }),
@@ -122,7 +139,7 @@ describe('Phase 2 document security API (e2e)', () => {
           (where.userId === undefined || item.userId === where.userId),
         ) ?? null)),
         create: jest.fn(({ data }: any) => {
-          const record = { id: randomUUID(), ...data, userId: data.userId ?? null, departmentId: data.departmentId ?? null, status: 'ACTIVE', createdAt: new Date(), revokedAt: null };
+          const record = { id: randomUUID(), revision: 0, ...data, userId: data.userId ?? null, departmentId: data.departmentId ?? null, status: 'ACTIVE', validFrom: data.validFrom ?? new Date(), validUntil: data.validUntil ?? null, reason: data.reason ?? null, createdAt: new Date(), revokedAt: null, revokedById: null, revokeReason: null };
           grants.push(record);
           return Promise.resolve(hydrateGrant(record));
         }),
@@ -131,11 +148,22 @@ describe('Phase 2 document security API (e2e)', () => {
           Object.assign(record, data);
           return Promise.resolve(record);
         }),
+        updateMany: jest.fn(({ where, data }: any) => {
+          const record = grants.find((item) => item.id === where.id && item.documentId === where.documentId &&
+            (!where.status || item.status === where.status) && (where.revision === undefined || item.revision === where.revision));
+          if (!record) return Promise.resolve({ count: 0 });
+          Object.assign(record, data, { revision: record.revision + (data.revision?.increment ?? 0) });
+          return Promise.resolve({ count: 1 });
+        }),
+        findUniqueOrThrow: jest.fn(({ where }: any) => {
+          const record = grants.find((item) => item.id === where.id);
+          return record ? Promise.resolve(record) : Promise.reject(new Error('Permission not found'));
+        }),
         findMany: jest.fn(({ where }: any) => Promise.resolve(grants.filter((item) => item.documentId === where.documentId).map(hydrateGrant))),
       },
       processingJob: {
         create: jest.fn(({ data }: any) => {
-          const record = { id: randomUUID(), ...data, status: 'PENDING', createdAt: new Date(), updatedAt: new Date() };
+          const record = { id: randomUUID(), ...data, status: 'QUEUED', attempts: 0, maxAttempts: 3, nextAttemptAt: new Date(), lockedAt: null, lockedBy: null, lastError: null, createdAt: new Date(), updatedAt: new Date(), startedAt: null, completedAt: null };
           jobs.push(record);
           return Promise.resolve(record);
         }),
@@ -149,8 +177,55 @@ describe('Phase 2 document security API (e2e)', () => {
         findMany: jest.fn(({ where }: any) => Promise.resolve(auditEvents.filter((item) => item.documentId === where.documentId).reverse().map((item) => ({
           ...item,
           actor: item.userId ? basicUser(item.userId) : null,
-          version: item.versionId ? versions.find((version) => version.id === item.versionId) ?? null : null,
+          version: item.versionId ? (() => {
+            const version = versions.find((candidate) => candidate.id === item.versionId);
+            return version ? { id: version.id, versionNumber: version.versionNumber, versionKind: version.versionKind } : null;
+          })() : null,
         })))),
+      },
+      custodyEvent: {
+        create: jest.fn(({ data }: any) => {
+          const record = { id: randomUUID(), ...data, createdAt: new Date() };
+          custodyEvents.push(record);
+          return Promise.resolve(record);
+        }),
+        findMany: jest.fn(({ where }: any) => Promise.resolve(custodyEvents.filter((item) => item.documentId === where.documentId).reverse().map((item) => ({
+          ...item,
+          actor: item.actorId ? basicUser(item.actorId) : null,
+          version: item.versionId ? (() => {
+            const version = versions.find((candidate) => candidate.id === item.versionId);
+            return version ? { id: version.id, versionNumber: version.versionNumber, versionKind: version.versionKind } : null;
+          })() : null,
+        })))),
+      },
+      legalHold: {
+        findFirst: jest.fn(({ where }: any) => Promise.resolve(legalHolds.find((item) =>
+          (!where.id || item.id === where.id) && item.documentId === where.documentId && (!where.status || item.status === where.status),
+        ) ?? null)),
+        findMany: jest.fn(({ where }: any) => Promise.resolve(legalHolds.filter((item) => item.documentId === where.documentId).map((item) => ({
+          ...item, placedBy: basicUser(item.placedById), releasedBy: item.releasedById ? basicUser(item.releasedById) : null,
+        })))),
+        create: jest.fn(({ data }: any) => {
+          const record = { id: randomUUID(), revision: 0, ...data, status: 'ACTIVE', placedAt: new Date(), releasedAt: null, releasedById: null, releaseReason: null };
+          legalHolds.push(record);
+          return Promise.resolve(record);
+        }),
+        update: jest.fn(({ where, data }: any) => {
+          const record = legalHolds.find((item) => item.id === where.id);
+          Object.assign(record, data);
+          return Promise.resolve(record);
+        }),
+        updateMany: jest.fn(({ where, data }: any) => {
+          const record = legalHolds.find((item) => item.id === where.id && item.documentId === where.documentId &&
+            (!where.status || item.status === where.status) && (where.revision === undefined || item.revision === where.revision));
+          if (!record) return Promise.resolve({ count: 0 });
+          Object.assign(record, data, { revision: record.revision + (data.revision?.increment ?? 0) });
+          return Promise.resolve({ count: 1 });
+        }),
+        findUniqueOrThrow: jest.fn(({ where }: any) => {
+          const record = legalHolds.find((item) => item.id === where.id);
+          return record ? Promise.resolve(record) : Promise.reject(new Error('Legal hold not found'));
+        }),
       },
       $queryRaw: jest.fn(() => Promise.resolve([])),
       $executeRaw: jest.fn(() => Promise.resolve(0)),
@@ -181,19 +256,26 @@ describe('Phase 2 document security API (e2e)', () => {
     ownerToken = await login('owner@sih.local');
     viewerToken = await login('viewer@sih.local');
     outsiderToken = await login('outsider@sih.local');
+    adminToken = await login('platform-admin@sih.local');
 
     function hydrateDocument(id: string, include: any) {
       const record = documents.find((item) => item.id === id);
       if (!record) return null;
       const current = versions.find((item) => item.id === record.currentVersionId);
       let permissionRows = grants.filter((item) => item.documentId === id);
-      const permissionWhere = include?.permissions?.where;
-      if (permissionWhere) {
-        permissionRows = permissionRows.filter((item) =>
-          item.status === permissionWhere.status && permissionWhere.permission.in.includes(item.permission) &&
-          permissionWhere.OR.some((principal: any) =>
-            (principal.userId && item.userId === principal.userId) ||
-            (principal.departmentId && item.departmentId === principal.departmentId),
+        const permissionWhere = include?.permissions?.where;
+        if (permissionWhere) {
+          const principalRules = [
+            ...(permissionWhere.OR ?? []),
+            ...((permissionWhere.AND ?? []).flatMap((clause: any) => clause.OR ?? [])),
+          ].filter((rule: any) => rule.userId || rule.departmentId);
+          const now = new Date();
+          permissionRows = permissionRows.filter((item) =>
+            item.status === permissionWhere.status && permissionWhere.permission.in.includes(item.permission) &&
+            item.validFrom <= now && (!item.validUntil || item.validUntil > now) &&
+            principalRules.some((principal: any) =>
+              (principal.userId && item.userId === principal.userId) ||
+              (principal.departmentId && item.departmentId === principal.departmentId),
           ),
         );
       }
@@ -241,6 +323,10 @@ describe('Phase 2 document security API (e2e)', () => {
     documentId = response.body.id as string;
     firstVersionId = response.body.currentVersion.id as string;
     expect(response.body.currentVersion.originalFilename).toBe('evidence.pdf');
+    expect(response.body.currentVersion.versionKind).toBe('ORIGINAL');
+    expect(response.body.currentVersion.isAuthoritative).toBe(true);
+    expect(response.body.classification).toBe('RESTRICTED');
+    expect(response.body.revision).toBe(0);
     expect(response.body.currentVersion).not.toHaveProperty('storageKey');
     expect(response.body.currentVersion).not.toHaveProperty('createdById');
     expect(response.body.currentVersion).not.toHaveProperty('documentId');
@@ -251,10 +337,22 @@ describe('Phase 2 document security API (e2e)', () => {
     expect(objects.get(stored.storageKey)?.includes(Buffer.from('phase-two'))).toBe(false);
   });
 
+  it('rejects stale record lifecycle revisions instead of silently overwriting', async () => {
+    await request(app.getHttpServer()).post(`/api/documents/${documentId}/record-status`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ status: 'FINAL', reason: 'Approve the initial record', expectedRevision: 0 }).expect(201);
+    await request(app.getHttpServer()).post(`/api/documents/${documentId}/record-status`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ status: 'DRAFT', reason: 'Stale reviewer correction', expectedRevision: 0 }).expect(409);
+    await request(app.getHttpServer()).post(`/api/documents/${documentId}/record-status`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ status: 'DRAFT', reason: 'Reviewed correction', expectedRevision: 1 }).expect(201);
+  });
+
   it('shares VIEW access with a department', async () => {
     const response = await request(app.getHttpServer()).post(`/api/documents/${documentId}/access`)
       .set('Authorization', `Bearer ${ownerToken}`)
-      .send({ departmentId: ids.viewerDepartment, permission: 'VIEW' })
+      .send({ departmentId: ids.viewerDepartment, permission: 'VIEW', reason: 'Assigned document review' })
       .expect(201);
     permissionId = response.body.id as string;
   });
@@ -279,12 +377,17 @@ describe('Phase 2 document security API (e2e)', () => {
     await request(app.getHttpServer()).get(`/api/documents/${documentId}/download`)
       .set('Authorization', `Bearer ${outsiderToken}`).expect(403);
     await request(app.getHttpServer()).delete(`/api/documents/${documentId}/access/${response.body.id}`)
-      .set('Authorization', `Bearer ${ownerToken}`).expect(200);
+      .set('Authorization', `Bearer ${ownerToken}`).send({ reason: 'Temporary test grant complete', expectedRevision: response.body.revision }).expect(200);
   });
 
   it('denies a user without access even when they supply a valid document ID', async () => {
     await request(app.getHttpServer()).get(`/api/documents/${documentId}`)
       .set('Authorization', `Bearer ${outsiderToken}`).expect(403);
+  });
+
+  it('does not give a platform administrator automatic evidence access', async () => {
+    await request(app.getHttpServer()).get(`/api/documents/${documentId}`)
+      .set('Authorization', `Bearer ${adminToken}`).expect(403);
   });
 
   it('creates version 2 without overwriting version 1 and can download both', async () => {
@@ -293,7 +396,11 @@ describe('Phase 2 document security API (e2e)', () => {
       .field('changeDescription', 'Updated findings')
       .attach('file', Buffer.from('%PDF-1.7\nversion-two'), { filename: 'evidence-v2.pdf', contentType: 'application/pdf' })
       .expect(201)
-      .expect(({ body }) => expect(body.versionNumber).toBe(2));
+      .expect(({ body }) => {
+        expect(body.versionNumber).toBe(2);
+        expect(body.versionKind).toBe('REVISION');
+        expect(body.parentVersionId).toBe(firstVersionId);
+      });
     const history = await request(app.getHttpServer()).get(`/api/documents/${documentId}/versions`)
       .set('Authorization', `Bearer ${ownerToken}`).expect(200);
     expect(history.body.map((item: any) => item.versionNumber)).toEqual([2, 1]);
@@ -309,7 +416,7 @@ describe('Phase 2 document security API (e2e)', () => {
 
   it('revokes access immediately', async () => {
     await request(app.getHttpServer()).delete(`/api/documents/${documentId}/access/${permissionId}`)
-      .set('Authorization', `Bearer ${ownerToken}`).expect(200);
+      .set('Authorization', `Bearer ${ownerToken}`).send({ reason: 'Review completed', expectedRevision: 0 }).expect(200);
     await request(app.getHttpServer()).get(`/api/documents/${documentId}`)
       .set('Authorization', `Bearer ${viewerToken}`).expect(403);
   });
@@ -322,6 +429,43 @@ describe('Phase 2 document security API (e2e)', () => {
       .set('Authorization', `Bearer ${ownerToken}`).expect(200)
       .expect(({ body }) => expect(body.status).toBe('MISMATCH'));
     expect(auditEvents.some((event) => event.action === 'INTEGRITY_FAILED')).toBe(true);
+  });
+
+  it('does not honor an expired grant', async () => {
+    grants.push({
+      id: randomUUID(), documentId, userId: ids.outsider, departmentId: null, permission: 'VIEW', status: 'ACTIVE',
+      grantedById: ids.owner, validFrom: new Date(Date.now() - 60_000), validUntil: new Date(Date.now() - 1_000),
+      reason: 'Expired review window', createdAt: new Date(), revokedAt: null,
+    });
+    await request(app.getHttpServer()).get(`/api/documents/${documentId}`)
+      .set('Authorization', `Bearer ${outsiderToken}`).expect(403);
+  });
+
+  it('records provenance and blocks disposition while a legal hold is active', async () => {
+    const hold = await request(app.getHttpServer()).post(`/api/documents/${documentId}/holds`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ reason: 'Court review is pending', reference: 'ORDER-14', expectedRevision: documents.find((item) => item.id === documentId).revision }).expect(201);
+
+    for (const status of ['FINAL', 'DECLARED_RECORD', 'DISPOSITION_DUE']) {
+      await request(app.getHttpServer()).post(`/api/documents/${documentId}/record-status`)
+        .set('Authorization', `Bearer ${ownerToken}`).send({ status, reason: `Move record to ${status}`, expectedRevision: documents.find((item) => item.id === documentId).revision }).expect(201);
+    }
+    await request(app.getHttpServer()).post(`/api/documents/${documentId}/record-status`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ status: 'DISPOSED', reason: 'Disposition period completed', expectedRevision: documents.find((item) => item.id === documentId).revision }).expect(409);
+    expect(documents.find((item) => item.id === documentId).recordStatus).toBe('DISPOSITION_DUE');
+    expect(auditEvents.some((event) => event.action === 'RECORD_DISPOSITION_BLOCKED')).toBe(true);
+
+    await request(app.getHttpServer()).post(`/api/documents/${documentId}/holds/${hold.body.id}/release`)
+      .set('Authorization', `Bearer ${ownerToken}`).send({ reason: 'Court review has completed', expectedDocumentRevision: documents.find((item) => item.id === documentId).revision, expectedHoldRevision: hold.body.revision }).expect(201);
+    await request(app.getHttpServer()).post(`/api/documents/${documentId}/record-status`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ status: 'DISPOSED', reason: 'Approved disposition completed', expectedRevision: documents.find((item) => item.id === documentId).revision }).expect(201);
+
+    const provenance = await request(app.getHttpServer()).get(`/api/documents/${documentId}/provenance`)
+      .set('Authorization', `Bearer ${ownerToken}`).expect(200);
+    expect(provenance.body.some((event: any) => event.type === 'HOLD_PLACED')).toBe(true);
+    expect(provenance.body.some((event: any) => event.type === 'DISPOSITION_BLOCKED')).toBe(true);
   });
 
   function upload(token: string, bytes: Buffer, filename: string, contentType: string) {
@@ -343,10 +487,10 @@ describe('Phase 2 document security API (e2e)', () => {
     return { id, code, name, description: null, createdAt: new Date(), updatedAt: new Date() };
   }
 
-  function user(id: string, email: string, departmentId: string, passwordHash: string) {
+  function user(id: string, email: string, departmentId: string, passwordHash: string, role = 'INVESTIGATOR') {
     return {
       id, email, name: email.split('@')[0], passwordHash, status: 'ACTIVE', departmentId,
-      roleId: 'INVESTIGATOR-id', role: { id: 'INVESTIGATOR-id', code: 'INVESTIGATOR', name: 'Investigator' },
+      roleId: `${role}-id`, role: { id: `${role}-id`, code: role, name: role === 'ADMIN' ? 'Administrator' : 'Investigator' },
       department: { id: departmentId, code: 'DEPT', name: 'Department' },
       createdAt: new Date(), updatedAt: new Date(),
     };

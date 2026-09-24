@@ -48,7 +48,7 @@ test('investigator document journey preserves versions and enforces a revoked gr
   await page.getByRole('tab', { name: /Documents/ }).click();
   await page.getByRole('button', { name: 'Upload document' }).click();
   await page.getByLabel('Document title').fill(title);
-  await page.getByLabel('Document type').fill('REPORT');
+  await page.getByLabel('Document type').selectOption('REPORT');
   await page.getByLabel('Source file').setInputFiles({ name: `record-${suffix}.txt`, mimeType: 'text/plain', buffer: Buffer.from(`Authorised test record\n${secret}`) });
   await page.getByRole('button', { name: 'Upload document' }).click();
   await page.locator('.primary-cell').filter({ hasText: title }).click();
@@ -73,6 +73,7 @@ test('investigator document journey preserves versions and enforces a revoked gr
 
   await page.getByRole('button', { name: 'Manage access' }).click();
   await page.locator('#grantDepartment').selectOption({ label: 'Financial Crime Unit (FIN)' });
+  await page.getByLabel('Reason').fill('Temporary cross-department UI review');
   await page.getByRole('button', { name: 'Grant VIEW access' }).click();
 
   await page.getByRole('button', { name: 'Sign out' }).click();
@@ -107,4 +108,23 @@ test('investigator document journey preserves versions and enforces a revoked gr
   await page.goto(documentUrl);
   await page.getByRole('tab', { name: /Audit/ }).click();
   await expect(page.getByRole('cell', { name: 'ACCESS REVOKED' }).first()).toBeVisible();
+
+  await page.getByRole('tab', { name: /Provenance/ }).click();
+  const holdForm = page.locator('form').filter({ hasText: 'Place legal hold' });
+  await holdForm.getByLabel('Reason').fill('Court review pending for browser verification');
+  await holdForm.getByLabel('Reference').fill(`UI-ORDER-${suffix}`);
+  await holdForm.getByRole('button', { name: 'Place hold' }).click();
+  await expect(page.getByText('Legal hold active')).toBeVisible();
+
+  const statusForm = page.locator('form').filter({ hasText: 'Change record status' });
+  for (const status of ['FINAL', 'DECLARED_RECORD', 'DISPOSITION_DUE']) {
+    await statusForm.getByLabel('Next status').selectOption(status);
+    await statusForm.getByLabel('Reason').fill(`Browser verification transition to ${status}`);
+    await statusForm.getByRole('button', { name: 'Update status' }).click();
+    await expect(page.locator('.record-sidebar').getByText(status.replaceAll('_', ' '), { exact: true })).toBeVisible();
+  }
+  await statusForm.getByLabel('Next status').selectOption('DISPOSED');
+  await statusForm.getByLabel('Reason').fill('Attempt disposition while court hold is active');
+  await statusForm.getByRole('button', { name: 'Update status' }).click();
+  await expect(page.getByText('Active legal hold prevents disposition')).toBeVisible();
 });

@@ -65,3 +65,18 @@ PostgreSQL/MinIO integration tests.
   replaced by in-memory mocks.
 - “PDF/image extraction implemented” remains only partially demonstrated; a
   representative OCR corpus has not passed.
+
+## Phase 2 verification addendum
+
+The following results were added after the Phase 1 matrix. They are code and mocked-infrastructure API verification until the new migration is deployed to a running local PostgreSQL instance.
+
+| ID | Claim | Evidence | Actual status |
+| --- | --- | --- | --- |
+| P2-01 | ADMIN has no automatic evidence access | Bypass removed; known-ID ADMIN request test returns 403 | VERIFIED IN API TEST |
+| P2-02 | Expired grants do not authorize | Time predicate in authorization/search/list; expired-grant request test returns 403 | VERIFIED IN API TEST |
+| P2-03 | Original and revisions are distinguishable | Schema/DTO response; upload ORIGINAL and v2 REVISION lineage assertions | VERIFIED IN API TEST |
+| P2-04 | Derived/redacted artifacts identify a source | Service requires same-document `sourceVersionId` and sets non-authoritative | IMPLEMENTED; NEGATIVE TEST PENDING |
+| P2-05 | Active legal hold blocks disposition | Hold/status API test returns 409, source status unchanged, audit/custody denial present | VERIFIED IN API TEST |
+| P2-06 | Custody events are separate from audit | `custody_events`, service/API and provenance response assertions | VERIFIED IN API TEST |
+| P2-07 | Classification limits evidence access | Central clearance predicate applied to resource/list/search | IMPLEMENTED; MATRIX TEST PARTIAL |
+| P2-08 | Phase 2 migration works on PostgreSQL | Fifth migration applied to local PostgreSQL; seed rerun completed | VERIFIED AT LOCAL RUNTIME |
