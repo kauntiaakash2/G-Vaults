@@ -11,6 +11,7 @@
     "build": "npm run build -w @sih/shared && npm run build -w @sih/api && npm run build -w @sih/web",
     "test": "npm run test -w @sih/api",
     "test:e2e": "npm run test:e2e -w @sih/api",
+    "test:integration": "npm run infra:test:up && npm run db:test:deploy && npm run test:integration -w @sih/api",
     "test:web": "npm run test:e2e -w @sih/web",
     "lint": "npm run lint -w @sih/api && npm run lint -w @sih/web",
     "db:generate": "npm run prisma:generate -w @sih/api",
@@ -18,7 +19,10 @@
     "db:deploy": "npm run prisma:deploy -w @sih/api",
     "db:seed": "npm run prisma:seed -w @sih/api",
     "infra:up": "docker compose up -d",
-    "infra:down": "docker compose down"
+    "infra:down": "docker compose down",
+    "infra:test:up": "docker compose -p sih-integration -f docker-compose.integration.yml up -d --wait",
+    "infra:test:down": "docker compose -p sih-integration -f docker-compose.integration.yml down -v",
+    "db:test:deploy": "DATABASE_URL=postgresql://sih_test:sih_test_password@localhost:55432/sih_integration npm --workspace=@sih/api exec -- prisma migrate deploy"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

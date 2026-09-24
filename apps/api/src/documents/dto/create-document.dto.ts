@@ -1,5 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+import { DocumentClassification } from '@prisma/client';
+import { IsEnum, IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+import { DOCUMENT_TYPES } from '../document-policy';
 
 export class CreateDocumentDto {
   @ApiProperty()
@@ -14,7 +16,11 @@ export class CreateDocumentDto {
 
   @ApiProperty({ example: 'REPORT' })
   @IsString()
-  @MinLength(2)
-  @MaxLength(50)
+  @IsIn(DOCUMENT_TYPES)
   documentType: string;
+
+  @ApiProperty({ enum: DocumentClassification, default: DocumentClassification.RESTRICTED, required: false })
+  @IsOptional()
+  @IsEnum(DocumentClassification)
+  classification?: DocumentClassification;
 }

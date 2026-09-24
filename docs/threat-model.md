@@ -55,7 +55,7 @@
 | Denial of service | Oversized upload | Multer and validator maximum | Oversize test passes | Memory buffering consumes API RAM; concurrent upload controls absent |
 | Elevation of privilege | SHARE user downloads evidence | Previously broader implication list | Demonstrated before fix; new regression passes | Fixed P1 |
 | Elevation of privilege | Investigator creates cross-department case | Previously allowed | New service rule and regression | Fixed P1 |
-| Elevation of privilege | ADMIN automatically reads all evidence | Explicit bypass | Code/runtime confirmed | Phase 2 separation-of-duties decision required |
+| Elevation of privilege | Platform admin attempts evidence access | ADMIN bypass removed; classification and explicit grants apply | API regression returns 403 | Monitor policy changes; add real-DB matrix |
 | Elevation of privilege | Frontend hidden button invoked directly | Backend guards/service checks | Direct API negative tests | Expand endpoint/permission matrix |
 
 ## Upload and parser abuse cases
@@ -116,7 +116,7 @@ protection.
 - **Open:** no quarantine/malware scanning and shallow rich-file validation.
 - **Open:** audit hash chain lacks verifier and independent protection.
 - **Open:** PDF/scanned OCR correctness lacks a passing corpus.
-- **Open:** ADMIN content bypass conflicts with separation of duties.
+- **Mitigated in Phase 2:** ADMIN no longer bypasses document authorization or uploads evidence.
 
 ### P2
 

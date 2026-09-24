@@ -42,15 +42,23 @@ export type DocumentVersionSummary = {
   mimeType: string;
   originalFilename: string;
   changeDescription: string | null;
+  versionKind: 'ORIGINAL' | 'REVISION' | 'DERIVED' | 'REDACTED';
+  parentVersionId: string | null;
+  sourceVersionId: string | null;
+  isAuthoritative: boolean;
+  transformationType: string | null;
   createdAt: string;
   creator?: { id: string; name: string };
 };
 
 export type DocumentSummary = {
   id: string;
+  revision: number;
   caseId: string;
   title: string;
   documentType: string;
+  classification: 'INTERNAL' | 'RESTRICTED' | 'CONFIDENTIAL' | 'HIGHLY_RESTRICTED';
+  recordStatus: 'DRAFT' | 'FINAL' | 'DECLARED_RECORD' | 'ARCHIVED' | 'DISPOSITION_DUE' | 'DISPOSED';
   encryption: 'AES-256-GCM';
   currentVersion: DocumentVersionSummary | null;
   case: { id: string; caseNumber: string; title: string };

@@ -64,4 +64,4 @@ function buildSearchUrl(filters: SearchFilters) {
 }
 
 function formatStatus(value: string) { return value.replaceAll('_', ' '); }
-function processingTone(value: string): 'success' | 'danger' | 'warning' | 'neutral' { return value === 'COMPLETED' ? 'success' : value === 'FAILED' ? 'danger' : value === 'PENDING' ? 'warning' : 'neutral'; }
+function processingTone(value: string): 'success' | 'danger' | 'warning' | 'neutral' { return ['SUCCEEDED', 'COMPLETED', 'READY'].includes(value) ? 'success' : ['FAILED', 'DEAD'].includes(value) ? 'danger' : ['QUEUED', 'RUNNING', 'RETRY_PENDING', 'PENDING', 'PENDING_OCR'].includes(value) ? 'warning' : 'neutral'; }

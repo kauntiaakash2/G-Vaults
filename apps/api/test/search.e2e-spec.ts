@@ -20,14 +20,17 @@ describe('Search authorization query', () => {
     await service.search({ q: 'known-secret' }, user);
 
     const where = findMany.mock.calls[0][0].where;
-    expect(where.AND[0]).toEqual({
+    expect(where.AND[0]).toMatchObject({
+      classification: { in: ['INTERNAL', 'RESTRICTED'] },
       OR: [
         { createdById: user.id },
         {
           permissions: {
             some: {
               status: 'ACTIVE',
-              OR: [{ userId: user.id }, { departmentId: user.departmentId }],
+              AND: expect.arrayContaining([
+                { OR: [{ userId: user.id }, { departmentId: user.departmentId }] },
+              ]),
             },
           },
         },

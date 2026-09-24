@@ -37,6 +37,7 @@ enum DocumentPermission {
 enum PermissionStatus {
   ACTIVE
   REVOKED
+  EXPIRED
 }
 
 enum AuditResult {
@@ -46,10 +47,69 @@ enum AuditResult {
 }
 
 enum ProcessingJobStatus {
-  PENDING
-  PROCESSING
-  COMPLETED
+  QUEUED
+  RUNNING
+  SUCCEEDED
   FAILED
+  RETRY_PENDING
+  DEAD
+}
+
+enum DocumentClassification {
+  INTERNAL
+  RESTRICTED
+  CONFIDENTIAL
+  HIGHLY_RESTRICTED
+}
+
+enum RecordStatus {
+  DRAFT
+  FINAL
+  DECLARED_RECORD
+  ARCHIVED
+  DISPOSITION_DUE
+  DISPOSED
+}
+
+enum VersionKind {
+  ORIGINAL
+  REVISION
+  DERIVED
+  REDACTED
+}
+
+enum CustodyEventCategory {
+  SECURITY
+  ACCESS
+  CUSTODY
+  PROCESSING
+  RECORD_LIFECYCLE
+  SYSTEM
+}
+
+enum CustodyEventType {
+  ACQUIRED
+  UPLOADED
+  ACCESSED
+  DOWNLOADED
+  ACCESS_GRANTED
+  ACCESS_REVOKED
+  DERIVED
+  VERIFIED
+  HOLD_PLACED
+  HOLD_RELEASED
+  RECORD_STATUS_CHANGED
+  DISPOSITION_BLOCKED
+}
+
+enum LegalHoldStatus {
+  ACTIVE
+  RELEASED
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
 }
 
 model Role {
@@ -65,39 +125,43 @@ model Role {
 }
 
 model Department {
-  id          String   @id @default(uuid())
-  name        String
-  code        String   @unique
-  description String?
-  users       User[]
-  cases       Case[]
-  ownedDocuments Document[]           @relation("DocumentOwnerDepartment")
+  id                  String                    @id @default(uuid())
+  name                String
+  code                String                    @unique
+  description         String?
+  users               User[]
+  cases               Case[]
+  ownedDocuments      Document[]                @relation("DocumentOwnerDepartment")
   documentPermissions DocumentPermissionGrant[]
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  createdAt           DateTime                  @default(now()) @map("created_at")
+  updatedAt           DateTime                  @updatedAt @map("updated_at")
 
   @@map("departments")
 }
 
 model User {
-  id                  String               @id @default(uuid())
+  id                  String                    @id @default(uuid())
   name                String
-  email               String               @unique
-  passwordHash        String               @map("password_hash")
-  roleId              String               @map("role_id")
-  departmentId        String?              @map("department_id")
-  status              UserStatus           @default(ACTIVE)
-  role                Role                 @relation(fields: [roleId], references: [id])
-  department          Department?          @relation(fields: [departmentId], references: [id])
-  createdCases        Case[]               @relation("CaseCreator")
+  email               String                    @unique
+  passwordHash        String                    @map("password_hash")
+  roleId              String                    @map("role_id")
+  departmentId        String?                   @map("department_id")
+  status              UserStatus                @default(ACTIVE)
+  role                Role                      @relation(fields: [roleId], references: [id])
+  department          Department?               @relation(fields: [departmentId], references: [id])
+  createdCases        Case[]                    @relation("CaseCreator")
   caseMemberships     CaseMember[]
   documentPermissions DocumentPermissionGrant[] @relation("PermissionUser")
   grantedPermissions  DocumentPermissionGrant[] @relation("PermissionGrantor")
   auditEvents         AuditEvent[]
-  uploadedVersions    DocumentVersion[]    @relation("VersionUploader")
-  createdDocuments    Document[]           @relation("DocumentCreator")
-  createdAt           DateTime             @default(now()) @map("created_at")
-  updatedAt           DateTime             @updatedAt @map("updated_at")
+  uploadedVersions    DocumentVersion[]         @relation("VersionUploader")
+  createdDocuments    Document[]                @relation("DocumentCreator")
+  revokedPermissions  DocumentPermissionGrant[] @relation("PermissionRevoker")
+  custodyEvents       CustodyEvent[]            @relation("CustodyActor")
+  placedLegalHolds    LegalHold[]               @relation("LegalHoldPlacer")
+  releasedLegalHolds  LegalHold[]               @relation("LegalHoldReleaser")
+  createdAt           DateTime                  @default(now()) @map("created_at")
+  updatedAt           DateTime                  @updatedAt @map("updated_at")
 
   @@index([roleId])
   @@index([departmentId])
@@ -105,20 +169,22 @@ model User {
 }
 
 model Case {
-  id           String       @id @default(uuid())
-  caseNumber   String       @unique @map("case_number")
-  title        String
-  description  String?
-  departmentId String       @map("department_id")
-  status       CaseStatus   @default(OPEN)
-  createdById  String       @map("created_by")
-  department   Department   @relation(fields: [departmentId], references: [id])
-  createdBy    User         @relation("CaseCreator", fields: [createdById], references: [id])
-  members      CaseMember[]
-  documents    Document[]
-  auditEvents  AuditEvent[]
-  createdAt    DateTime     @default(now()) @map("created_at")
-  updatedAt    DateTime     @updatedAt @map("updated_at")
+  id            String         @id @default(uuid())
+  caseNumber    String         @unique @map("case_number")
+  title         String
+  description   String?
+  departmentId  String         @map("department_id")
+  status        CaseStatus     @default(OPEN)
+  createdById   String         @map("created_by")
+  department    Department     @relation(fields: [departmentId], references: [id])
+  createdBy     User           @relation("CaseCreator", fields: [createdById], references: [id])
+  members       CaseMember[]
+  documents     Document[]
+  auditEvents   AuditEvent[]
+  custodyEvents CustodyEvent[]
+  legalHolds    LegalHold[]
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
 
   @@index([departmentId])
   @@index([createdById])
@@ -143,9 +209,12 @@ model Document {
   caseId            String                    @map("case_id")
   title             String
   documentType      String                    @map("document_type")
+  classification    DocumentClassification    @default(RESTRICTED)
+  recordStatus      RecordStatus              @default(DRAFT) @map("record_status")
   ownerDepartmentId String                    @map("owner_department_id")
   currentVersionId  String?                   @unique @map("current_version_id")
   createdById       String                    @map("created_by")
+  revision          Int                       @default(0)
   case              Case                      @relation(fields: [caseId], references: [id], onDelete: Cascade)
   ownerDepartment   Department                @relation("DocumentOwnerDepartment", fields: [ownerDepartmentId], references: [id])
   createdBy         User                      @relation("DocumentCreator", fields: [createdById], references: [id])
@@ -153,37 +222,53 @@ model Document {
   versions          DocumentVersion[]         @relation("DocumentVersions")
   permissions       DocumentPermissionGrant[]
   auditEvents       AuditEvent[]
+  custodyEvents     CustodyEvent[]
+  legalHolds        LegalHold[]
   createdAt         DateTime                  @default(now()) @map("created_at")
   updatedAt         DateTime                  @updatedAt @map("updated_at")
 
   @@index([caseId])
   @@index([ownerDepartmentId])
   @@index([createdById])
+  @@index([classification])
+  @@index([recordStatus])
   @@map("documents")
 }
 
 model DocumentVersion {
-  id                String          @id @default(uuid())
-  documentId        String          @map("document_id")
-  versionNumber     Int             @map("version_number")
-  storageKey        String          @unique @map("storage_key")
-  sha256Hash        String          @map("sha256_hash")
-  fileSize          BigInt          @map("file_size")
-  mimeType          String          @map("mime_type")
-  originalFilename  String          @map("original_filename")
-  createdById       String          @map("created_by")
-  changeDescription String?         @map("change_description")
-  document          Document        @relation("DocumentVersions", fields: [documentId], references: [id], onDelete: Cascade)
-  currentFor        Document?       @relation("CurrentDocumentVersion")
-  creator           User            @relation("VersionUploader", fields: [createdById], references: [id])
-  auditEvents       AuditEvent[]
-  processingJobs    ProcessingJob[]
-  ocrResult         OcrResult?
-  aiSummary         AiSummary?
-  createdAt         DateTime        @default(now()) @map("created_at")
+  id                 String            @id @default(uuid())
+  documentId         String            @map("document_id")
+  versionNumber      Int               @map("version_number")
+  storageKey         String            @unique @map("storage_key")
+  sha256Hash         String            @map("sha256_hash")
+  fileSize           BigInt            @map("file_size")
+  mimeType           String            @map("mime_type")
+  originalFilename   String            @map("original_filename")
+  createdById        String            @map("created_by")
+  changeDescription  String?           @map("change_description")
+  versionKind        VersionKind       @default(REVISION) @map("version_kind")
+  parentVersionId    String?           @map("parent_version_id")
+  sourceVersionId    String?           @map("source_version_id")
+  isAuthoritative    Boolean           @default(true) @map("is_authoritative")
+  transformationType String?           @map("transformation_type")
+  document           Document          @relation("DocumentVersions", fields: [documentId], references: [id], onDelete: Cascade)
+  currentFor         Document?         @relation("CurrentDocumentVersion")
+  creator            User              @relation("VersionUploader", fields: [createdById], references: [id])
+  auditEvents        AuditEvent[]
+  processingJobs     ProcessingJob[]
+  ocrResult          OcrResult?
+  aiSummary          AiSummary?
+  parentVersion      DocumentVersion?  @relation("VersionParent", fields: [parentVersionId], references: [id], onDelete: Restrict)
+  childVersions      DocumentVersion[] @relation("VersionParent")
+  sourceVersion      DocumentVersion?  @relation("VersionSource", fields: [sourceVersionId], references: [id], onDelete: Restrict)
+  derivedVersions    DocumentVersion[] @relation("VersionSource")
+  custodyEvents      CustodyEvent[]
+  createdAt          DateTime          @default(now()) @map("created_at")
 
   @@unique([documentId, versionNumber])
   @@index([createdById])
+  @@index([parentVersionId])
+  @@index([sourceVersionId])
   @@map("document_versions")
 }
 
@@ -195,17 +280,69 @@ model DocumentPermissionGrant {
   permission   DocumentPermission
   status       PermissionStatus   @default(ACTIVE)
   grantedById  String             @map("granted_by")
+  validFrom    DateTime           @default(now()) @map("valid_from")
+  validUntil   DateTime?          @map("valid_until")
+  reason       String?
+  revokedById  String?            @map("revoked_by")
+  revokeReason String?            @map("revoke_reason")
+  revision     Int                @default(0)
   document     Document           @relation(fields: [documentId], references: [id], onDelete: Cascade)
   department   Department?        @relation(fields: [departmentId], references: [id], onDelete: Cascade)
   user         User?              @relation("PermissionUser", fields: [userId], references: [id], onDelete: Cascade)
   grantedBy    User               @relation("PermissionGrantor", fields: [grantedById], references: [id])
+  revokedBy    User?              @relation("PermissionRevoker", fields: [revokedById], references: [id])
   createdAt    DateTime           @default(now()) @map("created_at")
   revokedAt    DateTime?          @map("revoked_at")
 
   @@index([documentId, status])
   @@index([departmentId])
   @@index([userId])
+  @@index([validUntil])
   @@map("document_permissions")
+}
+
+model CustodyEvent {
+  id         String               @id @default(uuid())
+  category   CustodyEventCategory
+  type       CustodyEventType
+  caseId     String               @map("case_id")
+  documentId String?              @map("document_id")
+  versionId  String?              @map("version_id")
+  actorId    String?              @map("actor_id")
+  details    Json?
+  case       Case                 @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  document   Document?            @relation(fields: [documentId], references: [id], onDelete: Restrict)
+  version    DocumentVersion?     @relation(fields: [versionId], references: [id], onDelete: Restrict)
+  actor      User?                @relation("CustodyActor", fields: [actorId], references: [id], onDelete: SetNull)
+  createdAt  DateTime             @default(now()) @map("created_at")
+
+  @@index([caseId, createdAt])
+  @@index([documentId, createdAt])
+  @@index([versionId])
+  @@map("custody_events")
+}
+
+model LegalHold {
+  id            String          @id @default(uuid())
+  caseId        String          @map("case_id")
+  documentId    String          @map("document_id")
+  reason        String
+  reference     String?
+  status        LegalHoldStatus @default(ACTIVE)
+  placedById    String          @map("placed_by")
+  placedAt      DateTime        @default(now()) @map("placed_at")
+  releasedById  String?         @map("released_by")
+  releasedAt    DateTime?       @map("released_at")
+  releaseReason String?         @map("release_reason")
+  revision      Int             @default(0)
+  case          Case            @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  document      Document        @relation(fields: [documentId], references: [id], onDelete: Restrict)
+  placedBy      User            @relation("LegalHoldPlacer", fields: [placedById], references: [id])
+  releasedBy    User?           @relation("LegalHoldReleaser", fields: [releasedById], references: [id])
+
+  @@index([caseId, status])
+  @@index([documentId, status])
+  @@map("legal_holds")
 }
 
 model AuditEvent {
@@ -240,16 +377,21 @@ model ProcessingJob {
   id                String              @id @default(uuid())
   documentVersionId String              @map("document_version_id")
   type              String              @default("OCR")
-  status            ProcessingJobStatus @default(PENDING)
+  status            ProcessingJobStatus @default(QUEUED)
   attempts          Int                 @default(0)
-  error             String?
+  maxAttempts       Int                 @default(3) @map("max_attempts")
+  nextAttemptAt     DateTime            @default(now()) @map("next_attempt_at")
+  lockedAt          DateTime?           @map("locked_at")
+  lockedBy          String?             @map("locked_by")
+  lastError         String?             @map("error")
   documentVersion   DocumentVersion     @relation(fields: [documentVersionId], references: [id], onDelete: Cascade)
   createdAt         DateTime            @default(now()) @map("created_at")
   updatedAt         DateTime            @updatedAt @map("updated_at")
   startedAt         DateTime?           @map("started_at")
   completedAt       DateTime?           @map("completed_at")
 
-  @@index([status, createdAt])
+  @@index([status, nextAttemptAt])
+  @@index([status, lockedAt])
   @@map("processing_jobs")
 }
 
@@ -277,4 +419,21 @@ model AiSummary {
   createdAt         DateTime        @default(now()) @map("created_at")
 
   @@map("ai_summaries")
+}
+
+model IdempotencyRecord {
+  id          String            @id @default(uuid())
+  userId      String            @map("user_id")
+  scope       String
+  key         String
+  requestHash String            @map("request_hash")
+  status      IdempotencyStatus @default(IN_PROGRESS)
+  response    Json?
+  expiresAt   DateTime          @map("expires_at")
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  @@unique([userId, scope, key])
+  @@index([expiresAt])
+  @@map("idempotency_records")
 }
